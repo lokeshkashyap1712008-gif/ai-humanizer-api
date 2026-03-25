@@ -1,0 +1,36 @@
+# Strong input sanitization + prompt injection protection
+
+import re
+
+BLOCK_PATTERNS = [
+    r"ignore.*instructions",
+    r"system prompt",
+    r"you are now",
+    r"disregard.*previous",
+    r"forget.*previous",
+    r"new instructions",
+    r"act as"
+]
+
+
+def sanitize_text(text: str) -> str:
+    if not text:
+        return ""
+
+    # Remove null bytes
+    text = text.replace("\x00", "")
+
+    # Normalize line endings
+    text = text.replace("\r\n", "\n")
+
+    # Remove excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Apply strong pattern removal
+    for pattern in BLOCK_PATTERNS:
+        text = re.sub(pattern, "[removed]", text, flags=re.IGNORECASE)
+
+    # Hard cap at 20,000 characters
+    text = text[:20000]
+
+    return text.strip()
