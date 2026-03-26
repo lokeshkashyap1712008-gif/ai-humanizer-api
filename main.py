@@ -1,33 +1,25 @@
-# Main FastAPI app — FINAL FIX (SlowAPI WORKING via middleware)
+# Main FastAPI app
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# Middleware + utils
 from middleware.auth import verify_rapidapi
 from middleware.rate_limit import limiter
 from utils.sanitize import sanitize_text
 from utils.tokens import count_words
 from config import PLAN_LIMITS
 
-# SlowAPI
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 # -----------------------------
 # App Init
 # -----------------------------
-app = FastAPI(
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
+app = FastAPI(docs_url="/docs", redoc_url="/redoc")
 
-# Attach limiter FIRST
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
-
-# THEN auth
 app.middleware("http")(verify_rapidapi)
 
 
@@ -35,7 +27,7 @@ app.middleware("http")(verify_rapidapi)
 # Rate Limit Handler
 # -----------------------------
 @app.exception_handler(RateLimitExceeded)
-def rate_limit_handler(request, exc):
+def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
         content={"error": "Max 10 requests per minute"}
@@ -57,7 +49,6 @@ class HumanizeRequest(BaseModel):
 def root():
     return {"message": "AI Humanizer API running"}
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -67,10 +58,9 @@ def health():
 # Humanize Endpoint
 # -----------------------------
 @app.post("/humanize")
+@limiter.limit("10/minute")          # ✅ decorator does the actual limiting
 async def humanize(request: Request, body: HumanizeRequest):
-
-    # 🔥 APPLY LIMIT MANUALLY (this fixes everything)
-    limiter.limit("10/minute")(humanize)(request)
+    # ❌ REMOVED: limiter.limit("10/minute")(humanize)(request)
 
     user_id = request.state.user_id
     plan = request.state.plan
