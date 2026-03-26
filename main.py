@@ -1,22 +1,28 @@
-# Main FastAPI app
+# Main FastAPI app — FINAL (Auth + AI + Rate Limit + Token Tracking)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+# Middleware + utils
 from middleware.auth import verify_rapidapi
 from middleware.rate_limit import limiter
 from utils.sanitize import sanitize_text
-from utils.tokens import count_words
+from utils.tokens import count_words, estimate_tokens
+from utils.ai_router import generate_humanized_text
 from config import PLAN_LIMITS
 
+# SlowAPI
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 # -----------------------------
 # App Init
 # -----------------------------
-app = FastAPI(docs_url="/docs", redoc_url="/redoc")
+app = FastAPI(
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
@@ -49,6 +55,7 @@ class HumanizeRequest(BaseModel):
 def root():
     return {"message": "AI Humanizer API running"}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -58,9 +65,8 @@ def health():
 # Humanize Endpoint
 # -----------------------------
 @app.post("/humanize")
-@limiter.limit("10/minute")          # ✅ decorator does the actual limiting
+@limiter.limit("10/minute")
 async def humanize(request: Request, body: HumanizeRequest):
-    # ❌ REMOVED: limiter.limit("10/minute")(humanize)(request)
 
     user_id = request.state.user_id
     plan = request.state.plan
@@ -68,7 +74,14 @@ async def humanize(request: Request, body: HumanizeRequest):
     if not body.text.strip():
         raise HTTPException(status_code=400, detail={"error": "Text is required"})
 
+    # -----------------------------
+    # Sanitize Input
+    # -----------------------------
     clean_text = sanitize_text(body.text)
+
+    # -----------------------------
+    # Word Count
+    # -----------------------------
     word_count = count_words(clean_text)
 
     if plan not in PLAN_LIMITS:
@@ -80,13 +93,52 @@ async def humanize(request: Request, body: HumanizeRequest):
             detail={"error": "Request exceeds per-request word limit"}
         )
 
-    humanized_text = f"Honestly, {clean_text}"
+    # -----------------------------
+    # AI Generation
+    # -----------------------------
+    try:
+        humanized_text = await generate_humanized_text(
+            clean_text,
+            body.mode,
+            plan
+        )
+    except Exception as e:
+        if str(e) == "timeout":
+            raise HTTPException(
+                status_code=408,
+                detail={"error": "AI request timeout"}
+            )
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail={"error": "AI service error. Try again."}
+            )
 
-    return {
-        "success": True,
-        "humanized_text": humanized_text,
-        "original_word_count": len(body.text.split()),
-        "output_word_count": len(humanized_text.split()),
-        "mode": body.mode,
-        "tokens_used": 0
-    }
+    # -----------------------------
+    # Token Tracking
+    # -----------------------------
+    tokens_used = estimate_tokens(clean_text)
+
+    # -----------------------------
+    # Usage Headers
+    # -----------------------------
+    limit = PLAN_LIMITS[plan]["monthly"]
+    used = 0  # (Redis later)
+    remaining = limit - used
+
+    response = JSONResponse(
+        content={
+            "success": True,
+            "humanized_text": humanized_text,
+            "original_word_count": len(body.text.split()),
+            "output_word_count": len(humanized_text.split()),
+            "mode": body.mode,
+            "tokens_used": tokens_used
+        }
+    )
+
+    response.headers["X-Words-Used"] = str(used)
+    response.headers["X-Words-Limit"] = str(limit)
+    response.headers["X-Words-Remaining"] = str(remaining)
+
+    return response

@@ -22,3 +22,9 @@ def get_month_expiry() -> int:
         next_month = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
 
     return int(next_month.timestamp())
+def count_words(text: str) -> int:
+    return len(text.split())
+
+
+def estimate_tokens(text: str) -> int:
+    return int(len(text.split()) * 1.3)
