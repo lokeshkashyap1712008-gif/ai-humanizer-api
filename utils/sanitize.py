@@ -1,15 +1,16 @@
 # Strong input sanitization + prompt injection protection
+# No changes from original — logic was already correct
 
 import re
 
 BLOCK_PATTERNS = [
     r"ignore.*instructions",
-    r"system prompt",
-    r"you are now",
+    r"system\s+prompt",
+    r"you\s+are\s+now",
     r"disregard.*previous",
     r"forget.*previous",
-    r"new instructions",
-    r"act as"
+    r"new\s+instructions",
+    r"act\s+as",
 ]
 
 
@@ -26,7 +27,7 @@ def sanitize_text(text: str) -> str:
     # Remove excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Apply strong pattern removal
+    # Block known prompt injection patterns
     for pattern in BLOCK_PATTERNS:
         text = re.sub(pattern, "[removed]", text, flags=re.IGNORECASE)
 

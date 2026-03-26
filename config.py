@@ -1,8 +1,8 @@
-# Plan limits (monthly + per request)
+# Plan limits — monthly word budget + per-request word cap
 
 PLAN_LIMITS = {
-    "free": {"monthly": 500, "per_request": 500},
-    "basic": {"monthly": 10000, "per_request": 2000},
-    "pro": {"monthly": 50000, "per_request": 5000},
-    "ultra": {"monthly": 250000, "per_request": 15000}
+    "free":  {"monthly": 500,    "per_request": 500},
+    "basic": {"monthly": 10000,  "per_request": 2000},
+    "pro":   {"monthly": 50000,  "per_request": 5000},
+    "ultra": {"monthly": 250000, "per_request": 15000},
 }

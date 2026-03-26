@@ -1,68 +1,85 @@
+# AI Router — Claude Sonnet 4.6 (Single Model)
+# Fixes: wrong model string, mode ignored for Claude, double system prompt,
+#        max_tokens too small for higher plans, missing API key validation
+
 import asyncio
 import os
-import google.generativeai as genai
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+# ✅ FIX #9 — Validate API key at startup, not silently at runtime
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+if not ANTHROPIC_KEY:
+    raise RuntimeError("Missing ANTHROPIC_API_KEY in environment. Check your .env file.")
 
-SYSTEM_PROMPT = """You are an expert writing editor who rewrites AI-generated text to sound authentically human..."""
+anthropic_client = Anthropic(api_key=ANTHROPIC_KEY)
+
+# ✅ FIX #1 — Single correct model string
+MODEL = "claude-sonnet-4-6"
+
+SYSTEM_PROMPT = """You are an expert writing editor who rewrites AI-generated text to sound \
+authentically human. Your goal is to preserve the original meaning while making the writing \
+feel natural, fluent, and indistinguishable from human-written text. Do not add extra \
+commentary — return only the rewritten text."""
 
 MODE_ADDITIONS = {
-    "standard": "",
-    "aggressive": " Heavily restructure every sentence.",
-    "academic": " Maintain formal academic tone.",
-    "casual": " Make it very conversational."
+    "standard":   "",
+    "aggressive": "Heavily restructure every sentence while preserving meaning.",
+    "academic":   "Maintain a formal academic tone throughout.",
+    "casual":     "Make the writing very conversational and relaxed.",
+}
+
+# ✅ FIX #11 — Scale max_tokens per plan so Pro/Ultra output is never truncated
+MAX_TOKENS_BY_PLAN = {
+    "free":  1000,
+    "basic": 2000,
+    "pro":   6000,
+    "ultra": 16000,
 }
 
 
-def get_model(plan: str):
-    plan = plan.lower()
-    if plan == "free":
-        return "gemini-2.5-flash-lite", "gemini"
-    elif plan == "basic":
-        return "gemini-2.5-flash", "gemini"
-    elif plan == "pro":
-        return "claude-haiku-4-5-20251001", "claude"
-    elif plan == "ultra":
-        return "claude-sonnet-4-20250514", "claude"
-    return "gemini-2.5-flash-lite", "gemini"
+async def call_claude(user_prompt: str, plan: str) -> str:
+    """
+    Call Claude Sonnet 4.6.
+    - system param holds the base system prompt (with prompt caching enabled)
+    - user_prompt contains only the mode instruction + user text
+    ✅ FIX #4 — System prompt is sent ONCE via the system param, not prepended to user message
+    """
+    max_tokens = MAX_TOKENS_BY_PLAN.get(plan, 1000)
 
-
-async def call_gemini(model_name, prompt):
-    model = genai.GenerativeModel(model_name)
-    response = await asyncio.to_thread(model.generate_content, prompt)
-    return response.text
-
-
-async def call_claude(model_name, prompt):
     response = await asyncio.to_thread(
         anthropic_client.messages.create,
-        model=model_name,
-        max_tokens=1000,
-        system=[{
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"}
-        }],
-        messages=[{"role": "user", "content": prompt}]
+        model=MODEL,
+        max_tokens=max_tokens,
+        system=[
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},  # Saves ~90% cost on repeated system prompt
+            }
+        ],
+        messages=[{"role": "user", "content": user_prompt}],
     )
     return response.content[0].text
 
 
-async def generate_humanized_text(text: str, mode: str, plan: str):
-    model_name, provider = get_model(plan)
+async def generate_humanized_text(text: str, mode: str, plan: str) -> str:
+    """
+    Build the user-facing prompt and route to Claude.
+    ✅ FIX #2 — Mode instruction is correctly included in the prompt passed to Claude
+    """
+    mode_instruction = MODE_ADDITIONS.get(mode, "")
 
-    prompt = SYSTEM_PROMPT + MODE_ADDITIONS.get(mode, "") + "\n\n" + text
+    # Build user prompt: mode instruction (if any) + the text to humanize
+    if mode_instruction:
+        user_prompt = f"{mode_instruction}\n\n{text}"
+    else:
+        user_prompt = text
 
     try:
-        if provider == "gemini":
-            return await asyncio.wait_for(call_gemini(model_name, prompt), timeout=30)
-        else:
-            return await asyncio.wait_for(call_claude(model_name, text), timeout=30)
+        return await asyncio.wait_for(call_claude(user_prompt, plan), timeout=30)
     except asyncio.TimeoutError:
         raise Exception("timeout")
     except Exception:
