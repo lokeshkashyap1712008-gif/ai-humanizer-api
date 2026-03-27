@@ -1,73 +1,68 @@
-# ============================================================
-# middleware/rate_limit.py
-# ============================================================
-# Security measures in this file:
-#   ✅ Redis backend (not in-memory) — limits survive restarts
-#      and work correctly across multiple workers
-#   ✅ Per-plan dynamic rate limits instead of one-size-fits-all
-#   ✅ Rate limiter key uses request.state.user_id (sanitized
-#      by auth middleware) not the raw header
-#   ✅ FIX: Startup Redis connectivity probe — slowapi silently
-#      falls back to an in-memory store if the Redis URI is
-#      unreachable at construction time. In-memory storage means
-#      rate limits are per-process rather than cluster-wide,
-#      allowing each worker to grant the full quota independently.
-#      An attacker running N concurrent connections defeats the
-#      limit by N×. We ping Redis at module import and raise
-#      RuntimeError if it is unreachable so the deploy fails
-#      fast rather than running with a broken limiter silently.
-#      Note: this is a synchronous probe using redis-py because
-#      the module is imported at startup (before the event loop
-#      starts). The asyncio client is used at request time.
-# ============================================================
+"""Rate-limit configuration with Redis in production and memory fallback in local dev."""
 
+import logging
 import os
+
 import redis as sync_redis
+from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from dotenv import load_dotenv
+from config import STRICT_EXTERNALS, APP_ENV
 
 load_dotenv()
 
-REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
-if not REDIS_URL:
-    raise RuntimeError("Missing UPSTASH_REDIS_URL in environment. Check your .env file.")
+logger = logging.getLogger(__name__)
 
-# ── FIX: Validate Redis is reachable before constructing the limiter ──
-# slowapi swallows connection errors and falls back to in-memory — this
-# probe ensures a mis-configured or offline Redis causes a hard startup
-# failure instead of a silent degradation to per-process rate limiting.
-try:
-    _probe = sync_redis.Redis.from_url(
-        REDIS_URL,
-        socket_timeout=3,
-        socket_connect_timeout=3,
-        decode_responses=True,
+REDIS_URL = os.getenv("UPSTASH_REDIS_URL", "").strip()
+
+
+if REDIS_URL:
+    # Validate Redis before constructing the limiter.
+    # This prevents a silent fallback to in-memory in production.
+    try:
+        _probe = sync_redis.Redis.from_url(
+            REDIS_URL,
+            socket_timeout=3,
+            socket_connect_timeout=3,
+            decode_responses=True,
+        )
+        _probe.ping()
+        _probe.close()
+    except Exception as exc:
+        raise RuntimeError(
+            "Rate limiter Redis probe failed - UPSTASH_REDIS_URL may be wrong "
+            f"or Redis is unreachable: {exc}"
+        ) from exc
+    _storage_uri = REDIS_URL
+else:
+    if STRICT_EXTERNALS:
+        raise RuntimeError(
+            "Missing UPSTASH_REDIS_URL. Production/strict mode requires Redis "
+            f"(APP_ENV={APP_ENV}, STRICT_EXTERNALS={STRICT_EXTERNALS})."
+        )
+    logger.warning(
+        "UPSTASH_REDIS_URL is missing. Using in-memory rate limiting; limits reset on restart."
     )
-    _probe.ping()
-    _probe.close()
-except Exception as exc:
-    raise RuntimeError(
-        f"Rate limiter Redis probe failed — UPSTASH_REDIS_URL may be wrong "
-        f"or Redis is unreachable: {exc}"
-    ) from exc
+    _storage_uri = "memory://"
 
 
 def get_user_identifier(request) -> str:
     """
-    Use the sanitized RapidAPI user ID from request.state if present,
-    otherwise fall back to IP address.
+    Encode plan into the key so slowapi's dynamic limit provider can
+    derive per-plan limits from the `key` argument.
     """
-    return getattr(request.state, "user_id", None) or get_remote_address(request)
-
-
-def get_rate_limit(request) -> str:
-    """Return a per-plan rate limit string."""
+    user_id = getattr(request.state, "user_id", None) or get_remote_address(request)
     plan = getattr(request.state, "plan", "free")
+    return f"{plan}:{user_id}"
+
+
+def get_rate_limit(key: str) -> str:
+    """Return a per-plan rate limit string from the encoded limiter key."""
+    plan = (key.split(":", 1)[0] if ":" in key else "free").lower()
     limits = {
-        "free":  "5/minute",
+        "free": "5/minute",
         "basic": "20/minute",
-        "pro":   "60/minute",
+        "pro": "60/minute",
         "ultra": "120/minute",
     }
     return limits.get(plan, "5/minute")
@@ -75,5 +70,5 @@ def get_rate_limit(request) -> str:
 
 limiter = Limiter(
     key_func=get_user_identifier,
-    storage_uri=REDIS_URL,
+    storage_uri=_storage_uri,
 )

@@ -7,3 +7,4 @@ slowapi==0.1.9
 python-dotenv==1.0.1
 pydantic==2.8.0
 secure==0.3.0
+httpx<0.28

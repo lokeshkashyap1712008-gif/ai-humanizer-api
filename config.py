@@ -1,5 +1,5 @@
 # ============================================================
-# config.py — Plan Limits + Mode Access Control
+# config.py — Plan Limits + Runtime Mode Controls
 # ============================================================
 # Matches pricing page exactly:
 #   Free:  $0   — 500 words/mo,     standard only,   500/req
@@ -7,6 +7,23 @@
 #   Pro:   $19  — 50,000 words/mo,  all 4 modes,   5,000/req
 #   Ultra: $49  — 250,000 words/mo, all 4 modes,  15,000/req
 # ============================================================
+
+import os
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV in {"production", "prod"}
+
+# In production this defaults to True (no in-memory fallbacks).
+# In development this defaults to False to keep local testing easy and cheap.
+STRICT_EXTERNALS = _env_bool("STRICT_EXTERNALS", IS_PRODUCTION)
 
 PLAN_LIMITS = {
     "free":  {"monthly": 500,    "per_request": 500},

@@ -50,7 +50,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from secure import SecureHeaders
+from secure import Secure
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
@@ -79,7 +79,7 @@ app.add_middleware(
 
 app.middleware("http")(verify_rapidapi)
 
-secure_headers = SecureHeaders()
+secure_headers = Secure()
 
 
 # ── Request ID ──────────────────────────────────────────────
@@ -124,17 +124,18 @@ async def body_limit_middleware(request: Request, call_next):
         except ValueError:
             pass
 
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > 50 * 1024:
-            return JSONResponse(status_code=413, content={"error": "Request too large"})
-        chunks.append(chunk)
+    body = await request.body()
+    if len(body) > 50 * 1024:
+        return JSONResponse(status_code=413, content={"error": "Request too large"})
 
-    body = b"".join(chunks)
+    # Ensure downstream consumers can read the body exactly once.
+    body_sent = False
 
     async def _receive():
+        nonlocal body_sent
+        if body_sent:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        body_sent = True
         return {"type": "http.request", "body": body, "more_body": False}
 
     request._receive = _receive

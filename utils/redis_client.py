@@ -1,48 +1,90 @@
-# ============================================================
-# utils/redis_client.py — Async Redis Singleton (Upstash)
-# ============================================================
-# Security / correctness measures in this file:
-#   ✅ UPSTASH_REDIS_URL validated at startup
-#   ✅ FIX: Switched from redis.Redis (synchronous) to
-#      redis.asyncio.Redis (asynchronous).
-#
-#      The original synchronous client blocked the FastAPI
-#      event loop on every redis.get() and pipe.execute()
-#      call inside the async humanize handler. Under moderate
-#      concurrency (many simultaneous requests), each Redis
-#      round-trip (~1–5 ms) would freeze the entire event
-#      loop, preventing other coroutines from making progress
-#      and causing cascading 408 Request Timeout errors.
-#
-#      redis.asyncio.Redis is a drop-in replacement that
-#      suspends the coroutine (await) during I/O instead of
-#      blocking the thread, keeping the event loop responsive.
-#
-#      Callers must await all Redis operations:
-#        used = int(await redis.get(month_key) or 0)
-#        await pipe.execute()
-# ============================================================
+"""Async Redis client with a local in-memory fallback for development."""
 
+import asyncio
+import logging
 import os
+import time
+from typing import Optional
+
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
+from config import STRICT_EXTERNALS, APP_ENV
 
 load_dotenv()
 
-_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
-if not _REDIS_URL:
-    raise RuntimeError("Missing UPSTASH_REDIS_URL in environment. Check your .env file.")
+logger = logging.getLogger(__name__)
 
-# Created once at import — safe across async workers, no lazy-init race condition.
-# FIX: redis.asyncio.Redis instead of redis.Redis — non-blocking I/O.
-_redis = aioredis.Redis.from_url(
-    _REDIS_URL,
-    socket_timeout=3,
-    socket_connect_timeout=3,
-    decode_responses=True,
-)
+_REDIS_URL = os.getenv("UPSTASH_REDIS_URL", "").strip()
 
 
-def get_redis() -> aioredis.Redis:
-    """Return the shared async Redis client."""
+class _InMemoryRedis:
+    """
+    Minimal async Redis-like client used when UPSTASH_REDIS_URL is not configured.
+
+    It implements only the methods used by main.py:
+    - eval(...): budget check + increment semantics
+    - get(key): fetch current value
+    """
+
+    def __init__(self):
+        self._store: dict[str, int] = {}
+        self._expiry: dict[str, int] = {}
+        self._lock = asyncio.Lock()
+
+    def _purge_if_expired(self, key: str, now_ts: int) -> None:
+        exp = self._expiry.get(key)
+        if exp is not None and now_ts >= exp:
+            self._store.pop(key, None)
+            self._expiry.pop(key, None)
+
+    async def get(self, key: str) -> Optional[str]:
+        now_ts = int(time.time())
+        async with self._lock:
+            self._purge_if_expired(key, now_ts)
+            value = self._store.get(key)
+            return str(value) if value is not None else None
+
+    async def eval(self, _script: str, _numkeys: int, key: str, limit: str, add: str, expiry: str) -> int:
+        # Keep behavior consistent with the Lua script in main.py:
+        # -1 => over limit
+        # -2 => expiry could not be set (not expected here)
+        monthly_limit = int(limit)
+        increment = int(add)
+        expiry_ts = int(expiry)
+        now_ts = int(time.time())
+
+        async with self._lock:
+            self._purge_if_expired(key, now_ts)
+            current = int(self._store.get(key, 0))
+
+            if current + increment > monthly_limit:
+                return -1
+
+            new_total = current + increment
+            self._store[key] = new_total
+            self._expiry[key] = expiry_ts
+            return new_total
+
+
+if _REDIS_URL:
+    _redis = aioredis.Redis.from_url(
+        _REDIS_URL,
+        socket_timeout=3,
+        socket_connect_timeout=3,
+        decode_responses=True,
+    )
+else:
+    if STRICT_EXTERNALS:
+        raise RuntimeError(
+            "Missing UPSTASH_REDIS_URL. Production/strict mode requires Redis "
+            f"(APP_ENV={APP_ENV}, STRICT_EXTERNALS={STRICT_EXTERNALS})."
+        )
+    logger.warning(
+        "UPSTASH_REDIS_URL is missing. Using in-memory quota store; data will reset on restart."
+    )
+    _redis = _InMemoryRedis()
+
+
+def get_redis():
+    """Return the shared async Redis-compatible client."""
     return _redis
