@@ -3,7 +3,7 @@
 # ============================================================
 # Security layers present in this file:
 #   ✅ Docs disabled (no /docs or /redoc in production)
-#   ✅ Security headers via `secure` libraryyeagt
+#   ✅ Security headers via `secure` library
 #   ✅ 30 s request timeout (async, non-blocking)
 #   ✅ Body size limit — streamed incrementally
 #   ✅ RapidAPI proxy-secret auth (see auth.py)
