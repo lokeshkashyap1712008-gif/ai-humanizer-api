@@ -13,9 +13,9 @@ class InjectionDetected(ValueError):
 
 # ── Constants ──────────────────────────────────────────────
 MAX_INPUT_LENGTH = 20_000
-MAX_B64_DECODE = 2000  # prevent heavy CPU decode attacks
+MAX_B64_DECODE = 2000
 
-# ── Regex (precompiled, optimized) ─────────────────────────
+# ── Regex ─────────────────────────────────────────────────
 _WORD_BOUNDARY = r"(?:^|\b)"
 
 HIGH_CONFIDENCE_PATTERNS = [
@@ -43,7 +43,8 @@ SOFT_PATTERNS = [
 ]
 
 _HIGH = [re.compile(p, re.IGNORECASE) for p in HIGH_CONFIDENCE_PATTERNS]
-_SOFT = [re.compile(p, re.IGNORECASE)]
+_SOFT = [re.compile(p, re.IGNORECASE) for p in SOFT_PATTERNS]
+
 
 _CONTROL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]')
 _INVISIBLE_RE = re.compile(
@@ -52,11 +53,9 @@ _INVISIBLE_RE = re.compile(
 _B64_RE = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
 
 
-# ── Base64 checker ─────────────────────────────────────────
 def _check_b64_blob(match: re.Match) -> str:
     raw = match.group()
 
-    # Prevent heavy decode attacks
     if len(raw) > MAX_B64_DECODE:
         return "[removed]"
 
@@ -81,47 +80,32 @@ def _check_b64_blob(match: re.Match) -> str:
     return raw
 
 
-# ── Main Sanitizer ─────────────────────────────────────────
 def sanitize_text(text: str) -> str:
     if not text:
         return ""
 
-    # ── Hard cap early (performance protection) ─────────────
     text = text[:MAX_INPUT_LENGTH]
 
-    # 1. Unicode normalization
     text = unicodedata.normalize("NFKC", text)
-
-    # 2. Remove invisible chars
     text = _INVISIBLE_RE.sub("", text)
-
-    # 3. Remove control chars
     text = _CONTROL_RE.sub("", text)
 
-    # 4. Normalize line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # 5. Collapse blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # 6. Remove markdown code blocks
     text = re.sub(r'```.*?```', '[removed]', text, flags=re.DOTALL)
     text = re.sub(r'`[^`]{0,500}`', '[removed]', text)
 
-    # 7. Base64 detection
     if len(text) > 40:
         text = _B64_RE.sub(_check_b64_blob, text)
 
-    # 8. High-confidence detection (REJECT)
     for pattern in _HIGH:
         if pattern.search(text):
             raise InjectionDetected("Injection detected")
 
-    # 9. Soft replacement
     for pattern in _SOFT:
         text = pattern.sub("[removed]", text)
 
-    # 10. Cleanup repeated artifacts
     text = re.sub(r'(\[removed\]\s*){2,}', '[removed] ', text)
 
     return text.strip()
