@@ -196,6 +196,8 @@ async def generate_humanized_text(text: str, mode: str, plan: str) -> str:
         try:
             return await _call_claude(prompt, plan, raw_len)
         except Exception as e:
-            logger.warning("AI failed → fallback (%s)", str(e))
+    if attempt == MAX_RETRIES:
+        logger.error("Claude failed: %s", str(e))
+        raise Exception(str(e))   # ✅ THIS IS THE FIX
 
     return _fallback(text, mode)

@@ -293,8 +293,9 @@ async def humanize(request: Request, body: HumanizeRequest):
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=408, detail="AI timeout")
-    except Exception:
-        raise HTTPException(status_code=502, detail="AI error")
+    except Exception as e:
+    logger.exception("AI ERROR request_id=%s", request_id)
+    raise HTTPException(status_code=502, detail=str(e))
 
     # Response
     return {
