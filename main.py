@@ -102,7 +102,10 @@ async def request_id_middleware(request: Request, call_next):
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
     response = await call_next(request)
-    secure_headers.headers(response)
+
+    # ✅ FIXED: correct method
+    secure_headers.framework.fastapi(response)
+
     return response
 
 
