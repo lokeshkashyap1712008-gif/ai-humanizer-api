@@ -1,4 +1,6 @@
-"""Rate-limit configuration with Redis in production and memory fallback in local dev."""
+# ============================================================
+# middleware/rate_limit.py — Production Rate Limiting
+# ============================================================
 
 import logging
 import os
@@ -6,8 +8,7 @@ import os
 import redis as sync_redis
 from dotenv import load_dotenv
 from slowapi import Limiter
-from slowapi.util import get_remote_address
-from config import STRICT_EXTERNALS, APP_ENV
+from config import STRICT_EXTERNALS, APP_ENV, RATE_LIMITS
 
 load_dotenv()
 
@@ -16,59 +17,90 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.getenv("UPSTASH_REDIS_URL", "").strip()
 
 
-if REDIS_URL:
-    # Validate Redis before constructing the limiter.
-    # This prevents a silent fallback to in-memory in production.
-    try:
-        _probe = sync_redis.Redis.from_url(
-            REDIS_URL,
-            socket_timeout=3,
-            socket_connect_timeout=3,
-            decode_responses=True,
-        )
-        _probe.ping()
-        _probe.close()
-    except Exception as exc:
-        raise RuntimeError(
-            "Rate limiter Redis probe failed - UPSTASH_REDIS_URL may be wrong "
-            f"or Redis is unreachable: {exc}"
-        ) from exc
-    _storage_uri = REDIS_URL
-else:
+# ── Redis Setup ────────────────────────────────────────────
+def _init_storage():
+    if REDIS_URL:
+        try:
+            client = sync_redis.Redis.from_url(
+                REDIS_URL,
+                socket_timeout=3,
+                socket_connect_timeout=3,
+                decode_responses=True,
+            )
+            client.ping()
+            client.close()
+
+            logger.info("Rate limiter using Redis backend")
+            return REDIS_URL
+
+        except Exception as exc:
+            if STRICT_EXTERNALS:
+                raise RuntimeError(
+                    "Redis connection failed in production"
+                ) from exc
+
+            logger.warning("Redis unavailable → falling back to memory")
+            return "memory://"
+
     if STRICT_EXTERNALS:
         raise RuntimeError(
-            "Missing UPSTASH_REDIS_URL. Production/strict mode requires Redis "
-            f"(APP_ENV={APP_ENV}, STRICT_EXTERNALS={STRICT_EXTERNALS})."
+            f"Missing UPSTASH_REDIS_URL (APP_ENV={APP_ENV})"
         )
-    logger.warning(
-        "UPSTASH_REDIS_URL is missing. Using in-memory rate limiting; limits reset on restart."
-    )
-    _storage_uri = "memory://"
+
+    logger.warning("Using in-memory rate limiting (dev mode)")
+    return "memory://"
 
 
+_storage_uri = _init_storage()
+
+
+# ── Key Function (CRITICAL) ─────────────────────────────────
 def get_user_identifier(request) -> str:
     """
-    Encode plan into the key so slowapi's dynamic limit provider can
-    derive per-plan limits from the `key` argument.
+    Build a robust, unique key per user.
+
+    Priority:
+    1. RapidAPI key (best)
+    2. user_id (fallback)
+    3. IP (last resort)
     """
-    user_id = getattr(request.state, "user_id", None) or get_remote_address(request)
+
+    headers = request.headers
+
+    api_key = headers.get("x-rapidapi-key")
+    user_id = getattr(request.state, "user_id", None)
     plan = getattr(request.state, "plan", "free")
-    return f"{plan}:{user_id}"
+
+    if api_key:
+        identity = api_key
+    elif user_id:
+        identity = user_id
+    else:
+        identity = request.client.host if request.client else "unknown"
+
+    # Namespaced key (future-proof)
+    return f"rl:v1:{plan}:{identity}"
 
 
+# ── Dynamic Rate Limit ─────────────────────────────────────
 def get_rate_limit(key: str) -> str:
-    """Return a per-plan rate limit string from the encoded limiter key."""
-    plan = (key.split(":", 1)[0] if ":" in key else "free").lower()
-    limits = {
-        "free": "5/minute",
-        "basic": "20/minute",
-        "pro": "60/minute",
-        "ultra": "120/minute",
-    }
-    return limits.get(plan, "5/minute")
+    """
+    Extract plan from key and return configured rate.
+    """
+
+    try:
+        # rl:v1:plan:user
+        parts = key.split(":")
+        plan = parts[2] if len(parts) >= 3 else "free"
+    except Exception:
+        plan = "free"
+
+    return RATE_LIMITS.get(plan, RATE_LIMITS["free"])
 
 
+# ── Limiter Instance ───────────────────────────────────────
 limiter = Limiter(
     key_func=get_user_identifier,
     storage_uri=_storage_uri,
+    strategy="fixed-window",  # predictable for billing
 )

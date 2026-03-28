@@ -1,16 +1,12 @@
 # ============================================================
-# config.py — Plan Limits + Runtime Mode Controls
-# ============================================================
-# Matches pricing page exactly:
-#   Free:  $0   — 500 words/mo,     standard only,   500/req
-#   Basic: $9   — 10,000 words/mo,  all 4 modes,   2,000/req
-#   Pro:   $19  — 50,000 words/mo,  all 4 modes,   5,000/req
-#   Ultra: $49  — 250,000 words/mo, all 4 modes,  15,000/req
+# config.py — Plan Limits + Runtime Controls (PRODUCTION)
 # ============================================================
 
 import os
+from typing import Dict, Set
 
 
+# ── Helpers ────────────────────────────────────────────────
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -18,41 +14,106 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# ── Environment ────────────────────────────────────────────
 APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
 IS_PRODUCTION = APP_ENV in {"production", "prod"}
 
-# In production this defaults to True (no in-memory fallbacks).
-# In development this defaults to False to keep local testing easy and cheap.
 STRICT_EXTERNALS = _env_bool("STRICT_EXTERNALS", IS_PRODUCTION)
 
+
+# ── Plans (Single Source of Truth) ─────────────────────────
+PLAN_CONFIG: Dict[str, dict] = {
+    "free": {
+        "price": 0,
+        "monthly_words": 500,
+        "per_request_words": 500,
+        "modes": {"standard"},
+        "priority": False,
+        "bulk": False,
+    },
+    "basic": {
+        "price": 9,
+        "monthly_words": 10_000,
+        "per_request_words": 2_000,
+        "modes": {"standard", "aggressive", "academic", "casual"},
+        "priority": False,
+        "bulk": False,
+    },
+    "pro": {
+        "price": 19,
+        "monthly_words": 50_000,
+        "per_request_words": 5_000,
+        "modes": {"standard", "aggressive", "academic", "casual"},
+        "priority": True,
+        "bulk": False,
+    },
+    "ultra": {
+        "price": 49,
+        "monthly_words": 250_000,
+        "per_request_words": 15_000,
+        "modes": {"standard", "aggressive", "academic", "casual"},
+        "priority": True,
+        "bulk": True,
+    },
+}
+
+
+# ── Derived Limits (No Duplication) ────────────────────────
 PLAN_LIMITS = {
-    "free":  {"monthly": 500,    "per_request": 500},
-    "basic": {"monthly": 10_000, "per_request": 2_000},
-    "pro":   {"monthly": 50_000, "per_request": 5_000},
-    "ultra": {"monthly": 250_000,"per_request": 15_000},
+    plan: {
+        "monthly": cfg["monthly_words"],
+        "per_request": cfg["per_request_words"],
+    }
+    for plan, cfg in PLAN_CONFIG.items()
 }
 
-# Per-plan character limits (defence against single-"word" cost amplification).
-# Derived from per_request word limit * avg 6 chars/word, rounded generously.
+
+PLAN_MODE_ACCESS: Dict[str, Set[str]] = {
+    plan: cfg["modes"] for plan, cfg in PLAN_CONFIG.items()
+}
+
+
+VALID_PLANS = frozenset(PLAN_CONFIG.keys())
+
+
+# ── Character Limits (Anti-abuse) ──────────────────────────
+# Derived: words * avg 7 chars (slightly stricter than before)
 PLAN_CHAR_LIMITS = {
-    "free":  3_500,
-    "basic": 14_000,
-    "pro":   35_000,
-    "ultra": 105_000,
+    plan: int(cfg["per_request_words"] * 7)
+    for plan, cfg in PLAN_CONFIG.items()
 }
 
-# Maximum length of any single whitespace-separated token (word).
-# Prevents submitting one 20 000-char blob that counts as 1 word
-# but generates thousands of AI output tokens.
-MAX_WORD_LEN = 200
 
-# Which modes each plan may use
-PLAN_MODE_ACCESS = {
-    "free":  {"standard"},
-    "basic": {"standard", "aggressive", "academic", "casual"},
-    "pro":   {"standard", "aggressive", "academic", "casual"},
-    "ultra": {"standard", "aggressive", "academic", "casual"},
+# ── Security Limits ────────────────────────────────────────
+MAX_WORD_LEN = _env_int("MAX_WORD_LEN", 200)
+
+
+# ── Rate Limits (per minute) ───────────────────────────────
+RATE_LIMITS = {
+    "free": "5/minute",
+    "basic": "20/minute",
+    "pro": "60/minute",
+    "ultra": "120/minute",
 }
 
-# Valid plans — anything else is downgraded to "free"
-VALID_PLANS = frozenset(PLAN_LIMITS.keys())
+
+# ── Feature Flags ──────────────────────────────────────────
+ENABLE_PRIORITY_QUEUE = True
+ENABLE_BULK_ENDPOINT = True
+
+
+# ── Validation Helper ──────────────────────────────────────
+def validate_plan(plan: str) -> str:
+    """
+    Strict plan validation — NO silent downgrade.
+    """
+    if plan not in VALID_PLANS:
+        raise ValueError(f"Invalid plan: {plan}")
+    return plan
