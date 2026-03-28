@@ -1,19 +1,65 @@
 # ============================================================
-# middleware/auth.py — RapidAPI Compatible Auth Middleware
+# middleware/auth.py — RapidAPI Authentication Middleware
 # ============================================================
+# Security measures in this file:
+#   ✅ hmac.compare_digest() — constant-time comparison,
+#      prevents timing-oracle brute-force of RAPIDAPI_SECRET
+#   ✅ Explicit bytes encoding before compare_digest —
+#      FIX: previously compared raw str values; a type
+#      mismatch (str vs bytes) raises TypeError instead of
+#      returning False, which leaks as a 500. Both sides are
+#      now .encode("utf-8") before comparison.
+#   ✅ Proxy-secret length capped before comparison —
+#      prevents memory pressure from oversized header values
+#   ✅ Plan validated against VALID_PLANS whitelist —
+#      spoofed header "x-rapidapi-subscription: god"
+#      is silently downgraded to "free"
+#   ✅ user_id validated via printable-ASCII regex, capped
+#      at 128 chars — prevents Redis key injection and
+#      CRLF injection via oversized header values
+#   ✅ Anonymous fallback uses per-IP hash — prevents budget
+#      collision DoS where one user exhausts the shared
+#      "anonymous" quota for all unauthenticated callers
+#   ✅ Secret validated at startup — mis-configured deploys
+#      fail immediately rather than silently at runtime
+#   ✅ /health bypasses auth (required for RapidAPI probes)
+# ============================================================
+
+import hashlib
+import hmac
+import os
+import re
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-import hashlib
-import re
+from dotenv import load_dotenv
 
 from config import VALID_PLANS
 
-# Only printable ASCII, 1–128 chars
+load_dotenv()
+
+RAPIDAPI_SECRET = os.getenv("RAPIDAPI_SECRET")
+if not RAPIDAPI_SECRET:
+    raise RuntimeError("Missing RAPIDAPI_SECRET in environment. Check your .env file.")
+
+# Encode once at startup — avoids per-request allocation
+_SECRET_BYTES = RAPIDAPI_SECRET.encode("utf-8")
+
+# Only printable ASCII, 1–128 chars (blocks null-byte / CRLF injection)
 _SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
+
+# Cap incoming secret header length before comparison to prevent memory pressure
+_MAX_SECRET_LEN = 512
 
 
 def _anonymous_id(request: Request) -> str:
+    """
+    Generate a per-IP anonymous ID instead of a shared literal.
+
+    Each IP gets its own Redis quota key so one caller cannot exhaust
+    the budget for all other anonymous callers. Raw IP is hashed so
+    it is never stored in Redis in plaintext.
+    """
     client_ip = (request.client.host if request.client else "unknown").encode("utf-8")
     ip_hash = hashlib.sha256(client_ip).hexdigest()[:16]
     return f"anon-{ip_hash}"
@@ -21,43 +67,47 @@ def _anonymous_id(request: Request) -> str:
 
 async def verify_rapidapi(request: Request, call_next):
     """
-    RapidAPI Auth Middleware (Fixed)
-
-    Uses:
-    - X-RapidAPI-Key (primary auth)
-    - X-RapidAPI-User (optional)
-    - X-RapidAPI-Subscription (plan)
+    1. Skip auth for /health (required by RapidAPI health probes)
+    2. Verify proxy secret — constant-time, type-safe bytes comparison
+    3. Whitelist-validate plan — prevents privilege escalation
+    4. Sanitize user_id — prevents Redis key injection
     """
 
-    # ✅ Allow health checks
     if request.url.path == "/health":
         return await call_next(request)
 
-    # 🔑 MAIN AUTH (RapidAPI standard)
-    api_key = request.headers.get("x-rapidapi-key")
+    raw_secret   = request.headers.get("x-rapidapi-proxy-secret", "")
+    raw_user_id  = request.headers.get("x-rapidapi-user", "")
+    raw_plan     = request.headers.get("x-rapidapi-subscription", "free").lower()
 
-    if not api_key:
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Missing RapidAPI key"}
+    # ── Constant-time secret verification ─────────────────
+    # Cap length first to avoid hashing a multi-MB attacker-supplied string.
+    if len(raw_secret) > _MAX_SECRET_LEN:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    try:
+        # FIX: encode both sides to bytes — str/bytes type mismatch raises
+        # TypeError which would surface as 500 instead of 401.
+        authorized = hmac.compare_digest(
+            raw_secret.encode("utf-8"),
+            _SECRET_BYTES,
         )
+    except Exception:
+        authorized = False
 
-    # 🧠 Optional headers
-    raw_user_id = request.headers.get("x-rapidapi-user", "")
-    raw_plan = request.headers.get("x-rapidapi-subscription", "free").lower()
+    if not authorized:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    # ✅ Plan validation
+    # ── Plan whitelist ─────────────────────────────────────
     plan = raw_plan if raw_plan in VALID_PLANS else "free"
 
-    # ✅ User ID sanitization
+    # ── Sanitize user_id ───────────────────────────────────
     if _SAFE_ID_RE.match(raw_user_id):
         user_id = raw_user_id
     else:
         user_id = _anonymous_id(request)
 
-    # Store in request state
     request.state.user_id = user_id
-    request.state.plan = plan
-    request.state.api_key = api_key  # useful for logging/rate limit
+    request.state.plan    = plan
 
     return await call_next(request)
