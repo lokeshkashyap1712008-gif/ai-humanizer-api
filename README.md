@@ -31,6 +31,7 @@ POST /humanize
 ### Headers (from RapidAPI)
 x-rapidapi-key: YOUR_API_KEY  
 x-rapidapi-host: YOUR_API_HOST  
+x-rapidapi-proxy-secret: injected by RapidAPI proxy  
 
 ---
 

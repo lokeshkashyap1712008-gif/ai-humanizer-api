@@ -33,7 +33,10 @@ from config import (
 # ── Config ────────────────────────────────────────────────
 MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", 50 * 1024))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
-RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
+RAPIDAPI_PROXY_SECRET = (
+    os.getenv("RAPIDAPI_PROXY_SECRET")
+    or os.getenv("RAPIDAPI_SECRET", "")
+)
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # ── Logging ───────────────────────────────────────────────
@@ -61,6 +64,9 @@ secure_headers = Secure()
 # ── RapidAPI Validation Middleware ────────────────────────
 @app.middleware("http")
 async def rapidapi_validation(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
+        return await call_next(request)
+
     required_headers = [
         "x-rapidapi-key",
         "x-rapidapi-user",
@@ -207,6 +213,12 @@ class HumanizeRequest(BaseModel):
         default="standard",
         pattern="^(standard|aggressive|academic|casual)$",
     )
+
+
+# ── Root Route ────────────────────────────────────────────
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "ai-humanizer-api"}
 
 
 # ── Health Route ──────────────────────────────────────────

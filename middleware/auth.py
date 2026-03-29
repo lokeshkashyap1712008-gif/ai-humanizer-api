@@ -38,9 +38,15 @@ from config import VALID_PLANS
 
 load_dotenv()
 
-RAPIDAPI_SECRET = os.getenv("RAPIDAPI_SECRET")
+RAPIDAPI_SECRET = (
+    os.getenv("RAPIDAPI_PROXY_SECRET")
+    or os.getenv("RAPIDAPI_SECRET")
+)
 if not RAPIDAPI_SECRET:
-    raise RuntimeError("Missing RAPIDAPI_SECRET in environment. Check your .env file.")
+    raise RuntimeError(
+        "Missing RapidAPI proxy secret in environment. "
+        "Set RAPIDAPI_PROXY_SECRET (preferred) or RAPIDAPI_SECRET."
+    )
 
 # Encode once at startup — avoids per-request allocation
 _SECRET_BYTES = RAPIDAPI_SECRET.encode("utf-8")
@@ -73,7 +79,7 @@ async def verify_rapidapi(request: Request, call_next):
     4. Sanitize user_id — prevents Redis key injection
     """
 
-    if request.url.path == "/health":
+    if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
         return await call_next(request)
 
     raw_secret   = request.headers.get("x-rapidapi-proxy-secret", "")
