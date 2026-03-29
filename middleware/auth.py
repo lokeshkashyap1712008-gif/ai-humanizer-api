@@ -22,13 +22,14 @@
 #      "anonymous" quota for all unauthenticated callers
 #   ✅ Secret validated at startup — mis-configured deploys
 #      fail immediately rather than silently at runtime
-#   ✅ /health bypasses auth (required for RapidAPI probes)
+#   ✅ /health and / bypass auth (required for Render + RapidAPI probes)
 # ============================================================
 
 import hashlib
 import hmac
 import os
 import re
+import logging
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -37,6 +38,8 @@ from dotenv import load_dotenv
 from config import VALID_PLANS
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 RAPIDAPI_SECRET = os.getenv("RAPIDAPI_SECRET")
 if not RAPIDAPI_SECRET:
@@ -50,6 +53,9 @@ _SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
 
 # Cap incoming secret header length before comparison to prevent memory pressure
 _MAX_SECRET_LEN = 512
+
+# Paths that bypass auth entirely (health probes from Render and RapidAPI)
+_BYPASS_PATHS = {"/health", "/"}
 
 
 def _anonymous_id(request: Request) -> str:
@@ -73,16 +79,23 @@ async def verify_rapidapi(request: Request, call_next):
     4. Sanitize user_id — prevents Redis key injection
     """
 
-    if request.url.path == "/health":
+    if request.url.path in _BYPASS_PATHS:
         return await call_next(request)
 
     raw_secret   = request.headers.get("x-rapidapi-proxy-secret", "")
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
     raw_plan     = request.headers.get("x-rapidapi-subscription", "free").lower()
 
+    # ── DEBUG logging (remove after confirming fix) ────────
+    logger.info("DEBUG raw_secret repr: %r", raw_secret)
+    logger.info("DEBUG expected secret repr: %r", RAPIDAPI_SECRET)
+    logger.info("DEBUG lengths — received: %d  expected: %d", len(raw_secret), len(RAPIDAPI_SECRET))
+    # ───────────────────────────────────────────────────────
+
     # ── Constant-time secret verification ─────────────────
     # Cap length first to avoid hashing a multi-MB attacker-supplied string.
     if len(raw_secret) > _MAX_SECRET_LEN:
+        logger.info("DEBUG 401: secret too long")
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     try:
@@ -96,6 +109,7 @@ async def verify_rapidapi(request: Request, call_next):
         authorized = False
 
     if not authorized:
+        logger.info("DEBUG 401: secret mismatch")
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     # ── Plan whitelist ─────────────────────────────────────
@@ -109,10 +123,5 @@ async def verify_rapidapi(request: Request, call_next):
 
     request.state.user_id = user_id
     request.state.plan    = plan
-
-    print("EXPECTED SECRET:", RAPIDAPI_SECRET)
-    print("RECEIVED SECRET:", raw_secret)
-
-
 
     return await call_next(request)
