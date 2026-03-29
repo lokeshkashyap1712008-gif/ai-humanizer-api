@@ -45,14 +45,10 @@ RAPIDAPI_SECRET = (
     os.getenv("RAPIDAPI_PROXY_SECRET")
     or os.getenv("RAPIDAPI_SECRET")
 )
-if not RAPIDAPI_SECRET:
-    raise RuntimeError(
-        "Missing RapidAPI proxy secret in environment. "
-        "Set RAPIDAPI_PROXY_SECRET (preferred) or RAPIDAPI_SECRET."
-    )
+REQUIRE_RAPIDAPI_PROXY_SECRET = os.getenv("REQUIRE_RAPIDAPI_PROXY_SECRET", "false").lower() == "true"
 
 # Encode once at startup — avoids per-request allocation
-_SECRET_BYTES = RAPIDAPI_SECRET.encode("utf-8")
+_SECRET_BYTES = RAPIDAPI_SECRET.encode("utf-8") if RAPIDAPI_SECRET else b""
 
 # Only printable ASCII, 1–128 chars (blocks null-byte / CRLF injection)
 _SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
@@ -91,6 +87,8 @@ async def verify_rapidapi(request: Request, call_next):
         return await call_next(request)
 
     raw_secret   = request.headers.get("x-rapidapi-proxy-secret", "")
+    raw_api_key  = request.headers.get("x-rapidapi-key", "")
+    raw_host     = request.headers.get("x-rapidapi-host", "")
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
     raw_plan     = request.headers.get("x-rapidapi-subscription", "free").lower()
 
@@ -100,40 +98,54 @@ async def verify_rapidapi(request: Request, call_next):
         request.method,
         bool(raw_secret),
         len(raw_secret),
-        "x-rapidapi-key" in request.headers,
-        "x-rapidapi-host" in request.headers,
+        bool(raw_api_key),
+        bool(raw_host),
         bool(raw_user_id),
         raw_plan,
     )
 
+    if not raw_api_key or not raw_host:
+        logger.warning(
+            "rapidapi_auth reject reason=missing_standard_headers path=%s has_key=%s has_host=%s",
+            request.url.path,
+            bool(raw_api_key),
+            bool(raw_host),
+        )
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
     # ── Constant-time secret verification ─────────────────
-    # Cap length first to avoid hashing a multi-MB attacker-supplied string.
-    if len(raw_secret) > _MAX_SECRET_LEN:
-        logger.warning(
-            "rapidapi_auth reject reason=secret_too_long path=%s len=%s",
-            request.url.path,
-            len(raw_secret),
-        )
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    # RapidAPI guarantees x-rapidapi-key + x-rapidapi-host for proxy traffic.
+    # Validate the proxy secret only when explicitly required, or when both
+    # a configured secret and a request secret are present.
+    should_validate_secret = REQUIRE_RAPIDAPI_PROXY_SECRET or bool(RAPIDAPI_SECRET and raw_secret)
 
-    try:
-        # FIX: encode both sides to bytes — str/bytes type mismatch raises
-        # TypeError which would surface as 500 instead of 401.
-        authorized = hmac.compare_digest(
-            raw_secret.encode("utf-8"),
-            _SECRET_BYTES,
-        )
-    except Exception:
-        authorized = False
+    if should_validate_secret:
+        # Cap length first to avoid hashing a multi-MB attacker-supplied string.
+        if len(raw_secret) > _MAX_SECRET_LEN:
+            logger.warning(
+                "rapidapi_auth reject reason=secret_too_long path=%s len=%s",
+                request.url.path,
+                len(raw_secret),
+            )
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    if not authorized:
-        logger.warning(
-            "rapidapi_auth reject reason=secret_mismatch path=%s secret_len=%s configured_len=%s",
-            request.url.path,
-            len(raw_secret),
-            len(_SECRET_BYTES),
-        )
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+        try:
+            authorized = hmac.compare_digest(
+                raw_secret.encode("utf-8"),
+                _SECRET_BYTES,
+            )
+        except Exception:
+            authorized = False
+
+        if not authorized:
+            logger.warning(
+                "rapidapi_auth reject reason=secret_mismatch path=%s secret_len=%s configured_len=%s require_secret=%s",
+                request.url.path,
+                len(raw_secret),
+                len(_SECRET_BYTES),
+                REQUIRE_RAPIDAPI_PROXY_SECRET,
+            )
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     # ── Plan whitelist ─────────────────────────────────────
     plan = raw_plan if raw_plan in VALID_PLANS else "free"
@@ -141,6 +153,8 @@ async def verify_rapidapi(request: Request, call_next):
     # ── Sanitize user_id ───────────────────────────────────
     if _SAFE_ID_RE.match(raw_user_id):
         user_id = raw_user_id
+    elif raw_api_key:
+        user_id = f"key-{hashlib.sha256(raw_api_key.encode('utf-8')).hexdigest()[:16]}"
     else:
         user_id = _anonymous_id(request)
 

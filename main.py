@@ -37,6 +37,7 @@ RAPIDAPI_PROXY_SECRET = (
     os.getenv("RAPIDAPI_PROXY_SECRET")
     or os.getenv("RAPIDAPI_SECRET", "")
 )
+REQUIRE_RAPIDAPI_PROXY_SECRET = os.getenv("REQUIRE_RAPIDAPI_PROXY_SECRET", "false").lower() == "true"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # ── Logging ───────────────────────────────────────────────
@@ -72,9 +73,7 @@ async def rapidapi_validation(request: Request, call_next):
 
     required_headers = [
         "x-rapidapi-key",
-        "x-rapidapi-user",
         "x-rapidapi-host",
-        "x-rapidapi-proxy-secret",
     ]
 
     for header in required_headers:
@@ -84,7 +83,10 @@ async def rapidapi_validation(request: Request, call_next):
                 content={"error": f"Missing header: {header}"},
             )
 
-    if request.headers.get("x-rapidapi-proxy-secret") != RAPIDAPI_PROXY_SECRET:
+    if (
+        REQUIRE_RAPIDAPI_PROXY_SECRET
+        and request.headers.get("x-rapidapi-proxy-secret") != RAPIDAPI_PROXY_SECRET
+    ):
         return JSONResponse(
             status_code=403,
             content={"error": "Invalid proxy secret"},
