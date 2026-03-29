@@ -27,6 +27,7 @@
 
 import hashlib
 import hmac
+import logging
 import os
 import re
 
@@ -37,6 +38,8 @@ from dotenv import load_dotenv
 from config import VALID_PLANS
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 RAPIDAPI_SECRET = (
     os.getenv("RAPIDAPI_PROXY_SECRET")
@@ -80,15 +83,37 @@ async def verify_rapidapi(request: Request, call_next):
     """
 
     if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
+        logger.info(
+            "rapidapi_auth bypass method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
         return await call_next(request)
 
     raw_secret   = request.headers.get("x-rapidapi-proxy-secret", "")
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
     raw_plan     = request.headers.get("x-rapidapi-subscription", "free").lower()
 
+    logger.info(
+        "rapidapi_auth request path=%s method=%s has_proxy_secret=%s secret_len=%s has_key=%s has_host=%s has_user=%s plan=%s",
+        request.url.path,
+        request.method,
+        bool(raw_secret),
+        len(raw_secret),
+        "x-rapidapi-key" in request.headers,
+        "x-rapidapi-host" in request.headers,
+        bool(raw_user_id),
+        raw_plan,
+    )
+
     # ── Constant-time secret verification ─────────────────
     # Cap length first to avoid hashing a multi-MB attacker-supplied string.
     if len(raw_secret) > _MAX_SECRET_LEN:
+        logger.warning(
+            "rapidapi_auth reject reason=secret_too_long path=%s len=%s",
+            request.url.path,
+            len(raw_secret),
+        )
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     try:
@@ -102,6 +127,12 @@ async def verify_rapidapi(request: Request, call_next):
         authorized = False
 
     if not authorized:
+        logger.warning(
+            "rapidapi_auth reject reason=secret_mismatch path=%s secret_len=%s configured_len=%s",
+            request.url.path,
+            len(raw_secret),
+            len(_SECRET_BYTES),
+        )
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     # ── Plan whitelist ─────────────────────────────────────
@@ -115,5 +146,12 @@ async def verify_rapidapi(request: Request, call_next):
 
     request.state.user_id = user_id
     request.state.plan    = plan
+
+    logger.info(
+        "rapidapi_auth accepted path=%s user_id=%s plan=%s",
+        request.url.path,
+        user_id,
+        plan,
+    )
 
     return await call_next(request)

@@ -49,6 +49,9 @@ logger = logging.getLogger(__name__)
 # ── App Init ──────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None)
 
+AUTH_DEBUG_VERSION = "rapidapi-auth-debug-v2"
+logger.info("Starting app with %s", AUTH_DEBUG_VERSION)
+
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
@@ -216,7 +219,7 @@ class HumanizeRequest(BaseModel):
 
 
 # ── Root Route ────────────────────────────────────────────
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"status": "ok", "service": "ai-humanizer-api"}
 
