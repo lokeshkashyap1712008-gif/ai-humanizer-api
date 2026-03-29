@@ -33,6 +33,7 @@ from config import (
 # ── Config ────────────────────────────────────────────────
 MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", 50 * 1024))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
+RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # ── Logging ───────────────────────────────────────────────
@@ -45,17 +46,6 @@ logger = logging.getLogger(__name__)
 # ── App Init ──────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None)
 
-secure_headers = Secure()
-
-# ── Auth Middleware ───────────────────────────────────────
-# IMPORTANT: register auth BEFORE add_middleware() calls.
-# @app.middleware decorators execute in reverse registration
-# order, but add_middleware() wraps OUTSIDE the decorator
-# stack entirely — so SlowAPIMiddleware and CORSMiddleware
-# will always run AFTER verify_rapidapi, ensuring
-# request.state.plan and user_id are set before rate limiting.
-app.middleware("http")(verify_rapidapi)
-
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
@@ -65,6 +55,37 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
+
+secure_headers = Secure()
+
+# ── RapidAPI Validation Middleware ────────────────────────
+@app.middleware("http")
+async def rapidapi_validation(request: Request, call_next):
+    required_headers = [
+        "x-rapidapi-key",
+        "x-rapidapi-user",
+        "x-rapidapi-host",
+        "x-rapidapi-proxy-secret",
+    ]
+
+    for header in required_headers:
+        if header not in request.headers:
+            return JSONResponse(
+                status_code=401,
+                content={"error": f"Missing header: {header}"},
+            )
+
+    if request.headers.get("x-rapidapi-proxy-secret") != RAPIDAPI_PROXY_SECRET:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Invalid proxy secret"},
+        )
+
+    return await call_next(request)
+
+
+# ── Auth Middleware ───────────────────────────────────────
+app.middleware("http")(verify_rapidapi)
 
 
 # ── Request ID Middleware ─────────────────────────────────
