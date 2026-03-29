@@ -110,9 +110,4 @@ async def verify_rapidapi(request: Request, call_next):
     request.state.user_id = user_id
     request.state.plan    = plan
 
-    print("EXPECTED SECRET:", RAPIDAPI_SECRET)
-    print("RECEIVED SECRET:", raw_secret)
-
-
-
     return await call_next(request)
