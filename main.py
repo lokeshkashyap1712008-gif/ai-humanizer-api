@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -123,24 +124,27 @@ async def timeout_middleware(request: Request, call_next):
 # ── Body Size Limit (Streaming Safe) ──────────────────────
 @app.middleware("http")
 async def body_limit_middleware(request: Request, call_next):
-    total = 0
-    chunks = []
-
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > MAX_BODY_SIZE:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_BODY_SIZE:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "Request too large"},
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid Content-Length header"},
+            )
+    else:
+        body = await request.body()
+        if len(body) > MAX_BODY_SIZE:
             return JSONResponse(
                 status_code=413,
                 content={"error": "Request too large"},
             )
-        chunks.append(chunk)
 
-    body = b"".join(chunks)
-
-    async def receive():
-        return {"type": "http.request", "body": body, "more_body": False}
-
-    request._receive = receive
     return await call_next(request)
 
 
@@ -159,6 +163,19 @@ def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
         content={"error": f"Rate limit exceeded: {msgs.get(plan, '5 requests/minute')}"},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning(
+        "Validation error path=%s errors=%s",
+        request.url.path,
+        exc.errors(),
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"error": "Invalid request body", "details": exc.errors()},
     )
 
 

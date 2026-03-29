@@ -95,10 +95,10 @@ class _UpstashRedis:
         return str(val) if val is not None else None
 
     async def eval(self, script: str, numkeys: int, key: str, limit: str, add: str, expiry: str) -> int:
+        _ = numkeys
         result = await self._safe_call(
             self._r.eval,
             script,
-            numkeys,
             [key],
             [limit, add, expiry],
         )
