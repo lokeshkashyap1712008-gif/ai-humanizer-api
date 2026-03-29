@@ -29,7 +29,6 @@ import hashlib
 import hmac
 import os
 import re
-import logging
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -38,8 +37,6 @@ from dotenv import load_dotenv
 from config import VALID_PLANS
 
 load_dotenv()
-
-logger = logging.getLogger(__name__)
 
 RAPIDAPI_SECRET = os.getenv("RAPIDAPI_SECRET")
 if not RAPIDAPI_SECRET:
@@ -83,18 +80,9 @@ async def verify_rapidapi(request: Request, call_next):
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
     raw_plan     = request.headers.get("x-rapidapi-subscription", "free").lower()
 
-    # ── DEBUG: log incoming headers (REMOVE AFTER DEBUGGING) ──
-    logger.info("DEBUG incoming headers: %s", dict(request.headers))
-    logger.info("DEBUG raw_secret repr: %r", raw_secret)
-    logger.info("DEBUG expected secret repr: %r", RAPIDAPI_SECRET)
-    logger.info("DEBUG secret lengths — received: %d  expected: %d", len(raw_secret), len(RAPIDAPI_SECRET))
-    logger.info("DEBUG secret match: %s", raw_secret == RAPIDAPI_SECRET)
-    # ──────────────────────────────────────────────────────────
-
     # ── Constant-time secret verification ─────────────────
     # Cap length first to avoid hashing a multi-MB attacker-supplied string.
     if len(raw_secret) > _MAX_SECRET_LEN:
-        logger.info("DEBUG 401 reason: secret too long (%d chars)", len(raw_secret))
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     try:
@@ -104,12 +92,10 @@ async def verify_rapidapi(request: Request, call_next):
             raw_secret.encode("utf-8"),
             _SECRET_BYTES,
         )
-    except Exception as e:
-        logger.info("DEBUG compare_digest exception: %r", e)
+    except Exception:
         authorized = False
 
     if not authorized:
-        logger.info("DEBUG 401 reason: secret mismatch — received %r", raw_secret)
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     # ── Plan whitelist ─────────────────────────────────────
