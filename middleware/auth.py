@@ -1,287 +1,113 @@
 # ============================================================
-# main.py — Production FastAPI Entry Point (FINAL)
+# middleware/auth.py — RapidAPI Authentication Middleware
+# ============================================================
+# Security measures in this file:
+#   ✅ hmac.compare_digest() — constant-time comparison,
+#      prevents timing-oracle brute-force of RAPIDAPI_SECRET
+#   ✅ Explicit bytes encoding before compare_digest —
+#      FIX: previously compared raw str values; a type
+#      mismatch (str vs bytes) raises TypeError instead of
+#      returning False, which leaks as a 500. Both sides are
+#      now .encode("utf-8") before comparison.
+#   ✅ Proxy-secret length capped before comparison —
+#      prevents memory pressure from oversized header values
+#   ✅ Plan validated against VALID_PLANS whitelist —
+#      spoofed header "x-rapidapi-subscription: god"
+#      is silently downgraded to "free"
+#   ✅ user_id validated via printable-ASCII regex, capped
+#      at 128 chars — prevents Redis key injection and
+#      CRLF injection via oversized header values
+#   ✅ Anonymous fallback uses per-IP hash — prevents budget
+#      collision DoS where one user exhausts the shared
+#      "anonymous" quota for all unauthenticated callers
+#   ✅ Secret validated at startup — mis-configured deploys
+#      fail immediately rather than silently at runtime
+#   ✅ /health bypasses auth (required for RapidAPI probes)
 # ============================================================
 
-import asyncio
-import logging
+import hashlib
+import hmac
 import os
-import uuid
-from datetime import datetime, timezone
+import re
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from secure import Secure
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
+from dotenv import load_dotenv
 
-from middleware.auth import verify_rapidapi
-from middleware.rate_limit import limiter, get_rate_limit
-from utils.sanitize import sanitize_text, InjectionDetected
-from utils.tokens import count_words, get_month_key, get_month_expiry
-from utils.ai_router import generate_humanized_text
-from utils.redis_client import get_redis
-from config import (
-    PLAN_LIMITS,
-    PLAN_CHAR_LIMITS,
-    MAX_WORD_LEN,
-    PLAN_MODE_ACCESS,
-    VALID_PLANS,
-)
+from config import VALID_PLANS
 
-# ── Config ────────────────────────────────────────────────
-MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", 50 * 1024))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+load_dotenv()
 
-# ── Logging ───────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
+RAPIDAPI_SECRET = os.getenv("RAPIDAPI_SECRET")
+if not RAPIDAPI_SECRET:
+    raise RuntimeError("Missing RAPIDAPI_SECRET in environment. Check your .env file.")
 
-# ── App Init ──────────────────────────────────────────────
-app = FastAPI(docs_url=None, redoc_url=None)
+# Encode once at startup — avoids per-request allocation
+_SECRET_BYTES = RAPIDAPI_SECRET.encode("utf-8")
 
-secure_headers = Secure()
+# Only printable ASCII, 1–128 chars (blocks null-byte / CRLF injection)
+_SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
 
-# ── Auth Middleware ───────────────────────────────────────
-# IMPORTANT: register auth BEFORE add_middleware() calls.
-# @app.middleware decorators execute in reverse registration
-# order, but add_middleware() wraps OUTSIDE the decorator
-# stack entirely — so SlowAPIMiddleware and CORSMiddleware
-# will always run AFTER verify_rapidapi, ensuring
-# request.state.plan and user_id are set before rate limiting.
-app.middleware("http")(verify_rapidapi)
-
-app.state.limiter = limiter
-app.add_middleware(SlowAPIMiddleware)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["POST", "GET"],
-    allow_headers=["*"],
-)
+# Cap incoming secret header length before comparison to prevent memory pressure
+_MAX_SECRET_LEN = 512
 
 
-# ── Request ID Middleware ─────────────────────────────────
-@app.middleware("http")
-async def request_id_middleware(request: Request, call_next):
-    request_id = uuid.uuid4().hex[:12]
-    request.state.request_id = request_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
+def _anonymous_id(request: Request) -> str:
+    """
+    Generate a per-IP anonymous ID instead of a shared literal.
+
+    Each IP gets its own Redis quota key so one caller cannot exhaust
+    the budget for all other anonymous callers. Raw IP is hashed so
+    it is never stored in Redis in plaintext.
+    """
+    client_ip = (request.client.host if request.client else "unknown").encode("utf-8")
+    ip_hash = hashlib.sha256(client_ip).hexdigest()[:16]
+    return f"anon-{ip_hash}"
 
 
-# ── Security Headers ──────────────────────────────────────
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    response = await call_next(request)
+async def verify_rapidapi(request: Request, call_next):
+    """
+    1. Skip auth for /health (required by RapidAPI health probes)
+    2. Verify proxy secret — constant-time, type-safe bytes comparison
+    3. Whitelist-validate plan — prevents privilege escalation
+    4. Sanitize user_id — prevents Redis key injection
+    """
 
-    # ✅ FIXED: correct method
-    secure_headers.framework.fastapi(response)
+    if request.url.path == "/health":
+        return await call_next(request)
 
-    return response
+    raw_secret   = request.headers.get("x-rapidapi-proxy-secret", "")
+    raw_user_id  = request.headers.get("x-rapidapi-user", "")
+    raw_plan     = request.headers.get("x-rapidapi-subscription", "free").lower()
 
+    # ── Constant-time secret verification ─────────────────
+    # Cap length first to avoid hashing a multi-MB attacker-supplied string.
+    if len(raw_secret) > _MAX_SECRET_LEN:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-# ── Timeout Middleware ────────────────────────────────────
-@app.middleware("http")
-async def timeout_middleware(request: Request, call_next):
     try:
-        return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT)
-    except asyncio.TimeoutError:
-        return JSONResponse(
-            status_code=408,
-            content={"error": "Request timeout"},
+        # FIX: encode both sides to bytes — str/bytes type mismatch raises
+        # TypeError which would surface as 500 instead of 401.
+        authorized = hmac.compare_digest(
+            raw_secret.encode("utf-8"),
+            _SECRET_BYTES,
         )
+    except Exception:
+        authorized = False
 
+    if not authorized:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-# ── Body Size Limit (Streaming Safe) ──────────────────────
-@app.middleware("http")
-async def body_limit_middleware(request: Request, call_next):
-    total = 0
-    chunks = []
+    # ── Plan whitelist ─────────────────────────────────────
+    plan = raw_plan if raw_plan in VALID_PLANS else "free"
 
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > MAX_BODY_SIZE:
-            return JSONResponse(
-                status_code=413,
-                content={"error": "Request too large"},
-            )
-        chunks.append(chunk)
+    # ── Sanitize user_id ───────────────────────────────────
+    if _SAFE_ID_RE.match(raw_user_id):
+        user_id = raw_user_id
+    else:
+        user_id = _anonymous_id(request)
 
-    body = b"".join(chunks)
+    request.state.user_id = user_id
+    request.state.plan    = plan
 
-    async def receive():
-        return {"type": "http.request", "body": body, "more_body": False}
-
-    request._receive = receive
     return await call_next(request)
-
-
-# ── Rate Limit Handler ────────────────────────────────────
-@app.exception_handler(RateLimitExceeded)
-def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    plan = getattr(request.state, "plan", "free")
-
-    msgs = {
-        "free": "5 requests/minute",
-        "basic": "20 requests/minute",
-        "pro": "60 requests/minute",
-        "ultra": "120 requests/minute",
-    }
-
-    return JSONResponse(
-        status_code=429,
-        content={"error": f"Rate limit exceeded: {msgs.get(plan, '5 requests/minute')}"},
-    )
-
-
-# ── Global Exception Handler ──────────────────────────────
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception(
-        "Unhandled error request_id=%s",
-        getattr(request.state, "request_id", "unknown"),
-    )
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error"},
-    )
-
-
-# ── Lua Script (Quota System) ─────────────────────────────
-_BUDGET_LUA = """
-local key      = KEYS[1]
-local limit    = tonumber(ARGV[1])
-local add      = tonumber(ARGV[2])
-local expiry   = tonumber(ARGV[3])
-
-local current  = tonumber(redis.call('GET', key) or 0)
-
-if current + add > limit then
-    return -1
-end
-
-local new_total = redis.call('INCRBY', key, add)
-
-local expiry_ok = redis.call('EXPIREAT', key, expiry)
-if expiry_ok == 0 then
-    return -2
-end
-
-return new_total
-"""
-
-
-# ── Request Model ─────────────────────────────────────────
-class HumanizeRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=MAX_BODY_SIZE)
-    mode: str = Field(
-        default="standard",
-        pattern="^(standard|aggressive|academic|casual)$",
-    )
-
-
-# ── Health Route ──────────────────────────────────────────
-@app.get("/health")
-async def health():
-    try:
-        redis = get_redis()
-        await redis.ping()
-        return {"status": "ok"}
-    except Exception:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "degraded"},
-        )
-
-
-# ── Main Route ────────────────────────────────────────────
-@app.post("/humanize")
-@limiter.limit(get_rate_limit)
-async def humanize(request: Request, body: HumanizeRequest):
-
-    request_id = getattr(request.state, "request_id", "unknown")
-
-    if not hasattr(request.state, "plan") or request.state.plan not in VALID_PLANS:
-        raise HTTPException(status_code=401, detail="Invalid subscription plan")
-
-    user_id = request.state.user_id
-    plan = request.state.plan
-
-    # Mode access
-    if body.mode not in PLAN_MODE_ACCESS[plan]:
-        raise HTTPException(status_code=403, detail="Mode not allowed for your plan")
-
-    # Sanitize
-    try:
-        clean_text = sanitize_text(body.text)
-    except InjectionDetected:
-        logger.warning("Injection detected request_id=%s", request_id)
-        raise HTTPException(status_code=400, detail="Invalid input")
-
-    if not clean_text:
-        raise HTTPException(status_code=400, detail="Empty text")
-
-    # Limits
-    if len(clean_text) > PLAN_CHAR_LIMITS[plan]:
-        raise HTTPException(status_code=400, detail="Character limit exceeded")
-
-    words = clean_text.split()
-
-    if any(len(w) > MAX_WORD_LEN for w in words):
-        raise HTTPException(status_code=400, detail="Invalid token detected")
-
-    if len(words) > PLAN_LIMITS[plan]["per_request"]:
-        raise HTTPException(status_code=400, detail="Word limit exceeded")
-
-    word_count = len(words)
-
-    # Redis quota
-    now = datetime.now(timezone.utc)
-    redis = get_redis()
-    key = get_month_key(user_id, now)
-
-    try:
-        result = await redis.eval(
-            _BUDGET_LUA,
-            1,
-            key,
-            str(PLAN_LIMITS[plan]["monthly"]),
-            str(word_count),
-            str(get_month_expiry(now)),
-        )
-        result = int(result)
-    except Exception:
-        raise HTTPException(status_code=503, detail="Service unavailable")
-
-    if result == -1:
-        raise HTTPException(status_code=429, detail="Monthly limit exceeded")
-
-    if result == -2:
-        raise HTTPException(status_code=503, detail="Quota system error")
-
-    # AI call
-    try:
-        humanized = await asyncio.wait_for(
-            generate_humanized_text(clean_text, body.mode, plan),
-            timeout=15,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="AI timeout")
-    except Exception:
-        raise HTTPException(status_code=502, detail="AI error")
-
-    # Response
-    return {
-        "success": True,
-        "humanized_text": humanized,
-        "original_word_count": word_count,
-        "output_word_count": count_words(humanized),
-    }
