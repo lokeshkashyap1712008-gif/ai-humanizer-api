@@ -61,6 +61,9 @@ secure_headers = Secure()
 # ── RapidAPI Validation Middleware ────────────────────────
 @app.middleware("http")
 async def rapidapi_validation(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+
     required_headers = [
         "x-rapidapi-key",
         "x-rapidapi-user",
@@ -75,12 +78,7 @@ async def rapidapi_validation(request: Request, call_next):
                 content={"error": f"Missing header: {header}"},
             )
 
-    if request.headers.get("x-rapidapi-proxy-secret") != RAPIDAPI_PROXY_SECRET:
-        return JSONResponse(
-            status_code=403,
-            content={"error": "Invalid proxy secret"},
-        )
-
+    # ✅ REMOVED the secret value check here — auth.py handles it
     return await call_next(request)
 
 
