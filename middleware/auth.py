@@ -106,18 +106,21 @@ async def verify_rapidapi(request: Request, call_next):
 
     if not raw_api_key or not raw_host:
         logger.warning(
-            "rapidapi_auth reject reason=missing_standard_headers path=%s has_key=%s has_host=%s",
+            "rapidapi_auth fallback reason=missing_standard_headers path=%s has_key=%s has_host=%s",
             request.url.path,
             bool(raw_api_key),
             bool(raw_host),
         )
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+        raw_api_key = ""
+        raw_host = ""
 
     # ── Constant-time secret verification ─────────────────
     # RapidAPI guarantees x-rapidapi-key + x-rapidapi-host for proxy traffic.
     # Validate the proxy secret only when explicitly required, or when both
     # a configured secret and a request secret are present.
-    should_validate_secret = REQUIRE_RAPIDAPI_PROXY_SECRET or bool(RAPIDAPI_SECRET and raw_secret)
+    should_validate_secret = bool(raw_secret) and (
+        REQUIRE_RAPIDAPI_PROXY_SECRET or bool(RAPIDAPI_SECRET)
+    )
 
     if should_validate_secret:
         # Cap length first to avoid hashing a multi-MB attacker-supplied string.

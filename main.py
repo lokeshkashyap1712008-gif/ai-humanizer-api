@@ -71,18 +71,6 @@ async def rapidapi_validation(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
         return await call_next(request)
 
-    required_headers = [
-        "x-rapidapi-key",
-        "x-rapidapi-host",
-    ]
-
-    for header in required_headers:
-        if header not in request.headers:
-            return JSONResponse(
-                status_code=401,
-                content={"error": f"Missing header: {header}"},
-            )
-
     if (
         REQUIRE_RAPIDAPI_PROXY_SECRET
         and request.headers.get("x-rapidapi-proxy-secret") != RAPIDAPI_PROXY_SECRET
