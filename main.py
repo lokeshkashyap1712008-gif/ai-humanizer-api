@@ -45,6 +45,17 @@ logger = logging.getLogger(__name__)
 # ── App Init ──────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None)
 
+secure_headers = Secure()
+
+# ── Auth Middleware ───────────────────────────────────────
+# IMPORTANT: register auth BEFORE add_middleware() calls.
+# @app.middleware decorators execute in reverse registration
+# order, but add_middleware() wraps OUTSIDE the decorator
+# stack entirely — so SlowAPIMiddleware and CORSMiddleware
+# will always run AFTER verify_rapidapi, ensuring
+# request.state.plan and user_id are set before rate limiting.
+app.middleware("http")(verify_rapidapi)
+
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
@@ -54,11 +65,6 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
-
-secure_headers = Secure()
-
-# ── Auth Middleware ───────────────────────────────────────
-app.middleware("http")(verify_rapidapi)
 
 
 # ── Request ID Middleware ─────────────────────────────────
