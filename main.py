@@ -1,5 +1,5 @@
 # ============================================================
-# main.py — Production FastAPI Entry Point (FIXED)
+# main.py — Production FastAPI Entry Point (FINAL)
 # ============================================================
 
 import asyncio
@@ -16,6 +16,7 @@ from secure import Secure
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from middleware.auth import verify_rapidapi
 from middleware.rate_limit import limiter, get_rate_limit
 from utils.sanitize import sanitize_text, InjectionDetected
 from utils.tokens import count_words, get_month_key, get_month_expiry
@@ -32,15 +33,8 @@ from config import (
 # ── Config ────────────────────────────────────────────────
 MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", 50 * 1024))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
-
-# ONE secret — read from RAPIDAPI_PROXY_SECRET env var
-# Set this in Render to match the Proxy Secret shown in your RapidAPI dashboard
-RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "").strip()
-
+RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-
-if not RAPIDAPI_PROXY_SECRET:
-    raise RuntimeError("Missing RAPIDAPI_PROXY_SECRET in environment.")
 
 # ── Logging ───────────────────────────────────────────────
 logging.basicConfig(
@@ -64,20 +58,72 @@ app.add_middleware(
 
 secure_headers = Secure()
 
-# ── NOTE ON MIDDLEWARE ORDER ──────────────────────────────
-# FastAPI runs middleware in REVERSE order of registration.
-# The LAST middleware added runs FIRST on incoming requests.
-# We register: body_limit → timeout → security → request_id → auth
-# Execution order: auth → request_id → security → timeout → body_limit
-# Auth MUST run first so request.state.plan/user_id are set
-# before the route handler is reached.
+# ── RapidAPI Validation Middleware ────────────────────────
+@app.middleware("http")
+async def rapidapi_validation(request: Request, call_next):
+    required_headers = [
+        "x-rapidapi-key",
+        "x-rapidapi-user",
+        "x-rapidapi-host",
+        "x-rapidapi-proxy-secret",
+    ]
 
-# ── 5. Body Size Limit (registered first = runs last) ─────
+    for header in required_headers:
+        if header not in request.headers:
+            return JSONResponse(
+                status_code=401,
+                content={"error": f"Missing header: {header}"},
+            )
+
+    if request.headers.get("x-rapidapi-proxy-secret") != RAPIDAPI_PROXY_SECRET:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Invalid proxy secret"},
+        )
+
+    return await call_next(request)
+
+
+# ── Auth Middleware ───────────────────────────────────────
+app.middleware("http")(verify_rapidapi)
+
+
+# ── Request ID Middleware ─────────────────────────────────
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = uuid.uuid4().hex[:12]
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+# ── Security Headers ──────────────────────────────────────
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+
+    # ✅ FIXED: correct method
+    secure_headers.framework.fastapi(response)
+
+    return response
+
+
+# ── Timeout Middleware ────────────────────────────────────
+@app.middleware("http")
+async def timeout_middleware(request: Request, call_next):
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT)
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=408,
+            content={"error": "Request timeout"},
+        )
+
+
+# ── Body Size Limit (Streaming Safe) ──────────────────────
 @app.middleware("http")
 async def body_limit_middleware(request: Request, call_next):
-    if request.url.path == "/health":
-        return await call_next(request)
-
     total = 0
     chunks = []
 
@@ -99,119 +145,18 @@ async def body_limit_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# ── 4. Timeout ────────────────────────────────────────────
-@app.middleware("http")
-async def timeout_middleware(request: Request, call_next):
-    if request.url.path == "/health":
-        return await call_next(request)
-    try:
-        return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT)
-    except asyncio.TimeoutError:
-        return JSONResponse(
-            status_code=408,
-            content={"error": "Request timeout"},
-        )
-
-
-# ── 3. Security Headers ───────────────────────────────────
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    response = await call_next(request)
-    secure_headers.framework.fastapi(response)
-    return response
-
-
-# ── 2. Request ID ─────────────────────────────────────────
-@app.middleware("http")
-async def request_id_middleware(request: Request, call_next):
-    request_id = uuid.uuid4().hex[:12]
-    request.state.request_id = request_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
-
-
-# ── 1. Auth (registered last = runs FIRST) ───────────────
-# This is the ONLY place we check the proxy secret and set
-# request.state.plan and request.state.user_id.
-# auth.py's verify_rapidapi is NOT used — it created the
-# duplicate-check conflict that caused the 401.
-import hashlib
-import hmac
-import re
-
-_SECRET_BYTES = RAPIDAPI_PROXY_SECRET.encode("utf-8")
-_MAX_SECRET_LEN = 512
-_SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
-
-
-def _anonymous_id(request: Request) -> str:
-    client_ip = (request.client.host if request.client else "unknown").encode("utf-8")
-    ip_hash = hashlib.sha256(client_ip).hexdigest()[:16]
-    return f"anon-{ip_hash}"
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    # Always allow health checks (required for RapidAPI probes)
-    if request.url.path == "/health":
-        return await call_next(request)
-
-    # ── Check required headers ────────────────────────────
-    required = ["x-rapidapi-key", "x-rapidapi-user", "x-rapidapi-host", "x-rapidapi-proxy-secret"]
-    for header in required:
-        if header not in request.headers:
-            return JSONResponse(
-                status_code=401,
-                content={"error": f"Missing header: {header}"},
-            )
-
-    # ── Verify proxy secret (constant-time) ───────────────
-    raw_secret = request.headers.get("x-rapidapi-proxy-secret", "")
-    if len(raw_secret) > _MAX_SECRET_LEN:
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
-
-    try:
-        authorized = hmac.compare_digest(
-            raw_secret.encode("utf-8"),
-            _SECRET_BYTES,
-        )
-    except Exception:
-        authorized = False
-
-    if not authorized:
-        logger.warning(
-            "Auth failed — proxy secret mismatch. "
-            "Check RAPIDAPI_PROXY_SECRET in Render matches your RapidAPI dashboard."
-        )
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
-
-    # ── Plan whitelist ────────────────────────────────────
-    raw_plan = request.headers.get("x-rapidapi-subscription", "free").lower()
-    plan = raw_plan if raw_plan in VALID_PLANS else "free"
-
-    # ── Sanitize user_id ──────────────────────────────────
-    raw_user_id = request.headers.get("x-rapidapi-user", "")
-    user_id = raw_user_id if _SAFE_ID_RE.match(raw_user_id) else _anonymous_id(request)
-
-    request.state.user_id = user_id
-    request.state.plan = plan
-
-    logger.info("Auth OK user=%s plan=%s", user_id, plan)
-
-    return await call_next(request)
-
-
 # ── Rate Limit Handler ────────────────────────────────────
 @app.exception_handler(RateLimitExceeded)
 def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     plan = getattr(request.state, "plan", "free")
+
     msgs = {
         "free": "5 requests/minute",
         "basic": "20 requests/minute",
         "pro": "60 requests/minute",
         "ultra": "120 requests/minute",
     }
+
     return JSONResponse(
         status_code=429,
         content={"error": f"Rate limit exceeded: {msgs.get(plan, '5 requests/minute')}"},
@@ -285,7 +230,6 @@ async def humanize(request: Request, body: HumanizeRequest):
 
     request_id = getattr(request.state, "request_id", "unknown")
 
-    # Auth middleware guarantees these exist, but guard anyway
     if not hasattr(request.state, "plan") or request.state.plan not in VALID_PLANS:
         raise HTTPException(status_code=401, detail="Invalid subscription plan")
 
@@ -355,6 +299,7 @@ async def humanize(request: Request, body: HumanizeRequest):
     except Exception:
         raise HTTPException(status_code=502, detail="AI error")
 
+    # Response
     return {
         "success": True,
         "humanized_text": humanized,
