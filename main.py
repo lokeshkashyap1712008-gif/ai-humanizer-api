@@ -8,7 +8,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -18,11 +18,14 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from middleware.auth import verify_rapidapi
+from middleware.jwt_auth import require_authenticated_user
 from middleware.rate_limit import limiter, get_rate_limit
 from utils.sanitize import sanitize_text, InjectionDetected
+from utils.post_process import humanize_post_process
 from utils.tokens import count_words, get_month_key, get_month_expiry
 from utils.ai_router import generate_humanized_text
 from utils.redis_client import get_redis
+from routes.auth_routes import router as auth_router
 from config import (
     PLAN_LIMITS,
     PLAN_CHAR_LIMITS,
@@ -50,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 # ── App Init ──────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None)
+app.include_router(auth_router)
 
 AUTH_DEBUG_VERSION = "rapidapi-auth-debug-v2"
 logger.info("Starting app with %s", AUTH_DEBUG_VERSION)
@@ -69,7 +73,14 @@ secure_headers = Secure()
 # ── RapidAPI Validation Middleware ────────────────────────
 @app.middleware("http")
 async def rapidapi_validation(request: Request, call_next):
-    if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
+    if (
+        request.method == "OPTIONS"
+        or request.url.path in {"/", "/health"}
+        or request.url.path.startswith("/auth/")
+    ):
+        return await call_next(request)
+
+    if request.headers.get("authorization", "").strip().lower().startswith("bearer "):
         return await call_next(request)
 
     if (
@@ -179,6 +190,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": detail},
+    )
+
+
 # ── Global Exception Handler ──────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -248,7 +268,11 @@ async def health():
 # ── Main Route ────────────────────────────────────────────
 @app.post("/humanize")
 @limiter.limit(get_rate_limit)
-async def humanize(request: Request, body: HumanizeRequest):
+async def humanize(
+    request: Request,
+    body: HumanizeRequest,
+    _auth_user: str = Depends(require_authenticated_user),
+):
 
     request_id = getattr(request.state, "request_id", "unknown")
 
@@ -321,10 +345,20 @@ async def humanize(request: Request, body: HumanizeRequest):
     except Exception:
         raise HTTPException(status_code=502, detail="AI error")
 
+    post_processed = humanize_post_process(humanized)
+    monthly_limit = PLAN_LIMITS[plan]["monthly"]
+    words_remaining = max(monthly_limit - result, 0)
+
     # Response
     return {
         "success": True,
-        "humanized_text": humanized,
+        "humanized_text": post_processed,
         "original_word_count": word_count,
-        "output_word_count": count_words(humanized),
+        "output_word_count": count_words(post_processed),
+        "mode": body.mode,
+        "quota": {
+            "words_used": result,
+            "words_limit": monthly_limit,
+            "words_remaining": words_remaining,
+        },
     }

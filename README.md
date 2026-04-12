@@ -26,6 +26,17 @@ POST /humanize
 
 ---
 
+## 🔐 Auth Endpoints
+
+POST /auth/signup  
+POST /auth/login
+
+`/humanize` can be called using either:
+- RapidAPI headers (`x-rapidapi-*`)
+- Bearer token from `/auth/login` in `Authorization: Bearer <token>`
+
+---
+
 ## 📥 Request
 
 ### Headers (from RapidAPI)

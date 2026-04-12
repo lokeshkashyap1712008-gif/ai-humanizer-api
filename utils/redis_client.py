@@ -45,6 +45,25 @@ class _InMemoryRedis:
     async def ping(self) -> str:
         return "PONG"
 
+    async def set(self, key: str, value: str, exat: Optional[int] = None) -> bool:
+        async with self._lock:
+            self._store[key] = value
+            if exat is not None:
+                self._expiry[key] = int(exat)
+            else:
+                self._expiry.pop(key, None)
+        return True
+
+    async def setnx(self, key: str, value: str) -> bool:
+        now_ts = int(time.time())
+        async with self._lock:
+            self._purge_if_expired(key, now_ts)
+            if key in self._store:
+                return False
+            self._store[key] = value
+            self._expiry.pop(key, None)
+            return True
+
     async def eval(self, _script: str, _numkeys: int, key: str, limit: str, add: str, expiry: str) -> int:
         monthly_limit = int(limit)
         increment = int(add)
@@ -93,6 +112,17 @@ class _UpstashRedis:
     async def get(self, key: str) -> Optional[str]:
         val = await self._safe_call(self._r.get, key)
         return str(val) if val is not None else None
+
+    async def set(self, key: str, value: str, exat: Optional[int] = None) -> bool:
+        if exat is not None:
+            await self._safe_call(self._r.set, key, value, exat=exat)
+        else:
+            await self._safe_call(self._r.set, key, value)
+        return True
+
+    async def setnx(self, key: str, value: str) -> bool:
+        result = await self._safe_call(self._r.setnx, key, value)
+        return bool(result)
 
     async def eval(self, script: str, numkeys: int, key: str, limit: str, add: str, expiry: str) -> int:
         _ = numkeys

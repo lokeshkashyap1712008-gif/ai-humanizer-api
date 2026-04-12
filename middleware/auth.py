@@ -55,19 +55,12 @@ _SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
 
 # Cap incoming secret header length before comparison to prevent memory pressure
 _MAX_SECRET_LEN = 512
+_PUBLIC_PATHS = {"/", "/health"}
+_PUBLIC_PREFIXES = ("/auth/",)
 
 
-def _anonymous_id(request: Request) -> str:
-    """
-    Generate a per-IP anonymous ID instead of a shared literal.
-
-    Each IP gets its own Redis quota key so one caller cannot exhaust
-    the budget for all other anonymous callers. Raw IP is hashed so
-    it is never stored in Redis in plaintext.
-    """
-    client_ip = (request.client.host if request.client else "unknown").encode("utf-8")
-    ip_hash = hashlib.sha256(client_ip).hexdigest()[:16]
-    return f"anon-{ip_hash}"
+def _is_public_path(path: str) -> bool:
+    return path in _PUBLIC_PATHS or any(path.startswith(prefix) for prefix in _PUBLIC_PREFIXES)
 
 
 async def verify_rapidapi(request: Request, call_next):
@@ -78,9 +71,18 @@ async def verify_rapidapi(request: Request, call_next):
     4. Sanitize user_id — prevents Redis key injection
     """
 
-    if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
+    if request.method == "OPTIONS" or _is_public_path(request.url.path):
         logger.info(
             "rapidapi_auth bypass method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
+        return await call_next(request)
+
+    auth_header = request.headers.get("authorization", "").strip().lower()
+    if auth_header.startswith("bearer "):
+        logger.info(
+            "rapidapi_auth bypass method=%s path=%s reason=bearer_token",
             request.method,
             request.url.path,
         )
@@ -106,13 +108,12 @@ async def verify_rapidapi(request: Request, call_next):
 
     if not raw_api_key or not raw_host:
         logger.warning(
-            "rapidapi_auth fallback reason=missing_standard_headers path=%s has_key=%s has_host=%s",
+            "rapidapi_auth reject reason=missing_standard_headers path=%s has_key=%s has_host=%s",
             request.url.path,
             bool(raw_api_key),
             bool(raw_host),
         )
-        raw_api_key = ""
-        raw_host = ""
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     # ── Constant-time secret verification ─────────────────
     # RapidAPI guarantees x-rapidapi-key + x-rapidapi-host for proxy traffic.
@@ -156,10 +157,8 @@ async def verify_rapidapi(request: Request, call_next):
     # ── Sanitize user_id ───────────────────────────────────
     if _SAFE_ID_RE.match(raw_user_id):
         user_id = raw_user_id
-    elif raw_api_key:
-        user_id = f"key-{hashlib.sha256(raw_api_key.encode('utf-8')).hexdigest()[:16]}"
     else:
-        user_id = _anonymous_id(request)
+        user_id = f"key-{hashlib.sha256(raw_api_key.encode('utf-8')).hexdigest()[:16]}"
 
     request.state.user_id = user_id
     request.state.plan    = plan
