@@ -1,4 +1,4 @@
-# AI Humanizer API — Undetectable AI Text Converter
+# AI Humanizer API -— Undetectable AI Text Converter
 
 Convert AI-generated text into natural, human-like writing.
 
