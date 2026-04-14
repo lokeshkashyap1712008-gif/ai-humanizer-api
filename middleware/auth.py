@@ -106,7 +106,7 @@ async def verify_rapidapi(request: Request, call_next):
         raw_plan,
     )
 
-    if not raw_api_key or not raw_host:
+    if not raw_api_key:
         logger.warning(
             "rapidapi_auth reject reason=missing_standard_headers path=%s has_key=%s has_host=%s",
             request.url.path,
