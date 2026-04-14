@@ -62,21 +62,26 @@ def get_user_identifier(request) -> str:
     Priority:
     1. RapidAPI key (best)
     2. user_id (fallback)
-    3. IP (last resort)
+    3. IP (last resort - only for public endpoints)
     """
 
     headers = request.headers
 
     api_key = headers.get("x-rapidapi-key")
     user_id = getattr(request.state, "user_id", None)
-    plan = getattr(request.state, "plan", "free")
+    plan = getattr(request.state, "plan", "basic")
 
     if api_key:
-        identity = api_key
+        # Use hashed API key to avoid key exposure in Redis
+        import hashlib
+        identity = hashlib.sha256(api_key.encode()).hexdigest()[:16]
     elif user_id:
         identity = user_id
+    elif request.client:
+        # Only use IP for public endpoints with no auth
+        identity = request.client.host
     else:
-        identity = request.client.host if request.client else "unknown"
+        identity = "unknown"
 
     # Namespaced key (future-proof)
     return f"rl:v1:{plan}:{identity}"

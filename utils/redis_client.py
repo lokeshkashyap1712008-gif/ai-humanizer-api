@@ -64,11 +64,14 @@ class _InMemoryRedis:
             self._expiry.pop(key, None)
             return True
 
-    async def eval(self, _script: str, _numkeys: int, key: str, limit: str, add: str, expiry: str) -> int:
-        monthly_limit = int(limit)
-        increment = int(add)
-        expiry_ts = int(expiry)
+    async def eval(self, _script: str, _numkeys: int, key: str, *args: str) -> int:
+        """Execute Lua-like quota script with variable args (limit, [add], expiry)."""
+        monthly_limit = int(args[0])
+        expiry_ts = int(args[-1])
         now_ts = int(time.time())
+
+        # Determine increment (for words) or 1 (for requests)
+        increment = int(args[1]) if len(args) > 2 else 1
 
         if increment < 0 or monthly_limit < 0:
             raise ValueError("Invalid quota values")
@@ -124,13 +127,15 @@ class _UpstashRedis:
         result = await self._safe_call(self._r.setnx, key, value)
         return bool(result)
 
-    async def eval(self, script: str, numkeys: int, key: str, limit: str, add: str, expiry: str) -> int:
+    async def eval(self, script: str, numkeys: int, key: str, *args: str) -> int:
+        """Execute Lua script with variable arguments."""
         _ = numkeys
+        # args can be (limit, add, expiry) for words or (limit, expiry) for requests
         result = await self._safe_call(
             self._r.eval,
             script,
             [key],
-            [limit, add, expiry],
+            list(args),
         )
         return int(result)
 

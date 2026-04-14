@@ -92,7 +92,7 @@ async def verify_rapidapi(request: Request, call_next):
     raw_api_key  = request.headers.get("x-rapidapi-key", "")
     raw_host     = request.headers.get("x-rapidapi-host", "")
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
-    raw_plan     = request.headers.get("x-rapidapi-subscription", "free").lower()
+    raw_plan     = request.headers.get("x-rapidapi-subscription", "basic").lower()
 
     logger.info(
         "rapidapi_auth request path=%s method=%s has_proxy_secret=%s secret_len=%s has_key=%s has_host=%s has_user=%s plan=%s",

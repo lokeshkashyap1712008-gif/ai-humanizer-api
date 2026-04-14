@@ -73,7 +73,7 @@ async def signup_user(email: str, password: str, plan: str = "free") -> dict:
     normalized_email = _normalize_email(email)
     validated_password = _validate_password(password)
 
-    normalized_plan = (plan or "free").strip().lower()
+    normalized_plan = (plan or "basic").strip().lower()
     if normalized_plan not in VALID_PLANS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

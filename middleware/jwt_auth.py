@@ -55,9 +55,9 @@ async def require_authenticated_user(request: Request) -> str:
 
         user_doc = await get_user_by_id(user_id)
 
-        plan = str(user_doc.get("plan") or "free").lower()
+        plan = str(user_doc.get("plan") or "basic").lower()
         if plan not in VALID_PLANS:
-            plan = "free"
+            plan = "basic"
 
         request.state.user_id = user_id
         request.state.plan = plan
