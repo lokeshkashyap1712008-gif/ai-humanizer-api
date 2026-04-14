@@ -299,7 +299,6 @@ async def health():
 async def humanize(
     request: Request,
     body: HumanizeRequest,
-    _auth_user: str = Depends(require_authenticated_user),
 ):
 
     request_id = getattr(request.state, "request_id", "unknown")
