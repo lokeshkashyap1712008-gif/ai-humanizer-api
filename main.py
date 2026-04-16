@@ -27,21 +27,19 @@ from utils.ai_router import generate_humanized_text
 from utils.redis_client import get_redis
 from routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router
 from config import (
+    DEFAULT_PLAN,
+    PLAN_CONFIG,
     PLAN_LIMITS,
     PLAN_CHAR_LIMITS,
     MAX_WORD_LEN,
     PLAN_MODE_ACCESS,
+    RATE_LIMITS,
     VALID_PLANS,
 )
 
 # ── Config ────────────────────────────────────────────────
 MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", 50 * 1024))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
-RAPIDAPI_PROXY_SECRET = (
-    os.getenv("RAPIDAPI_PROXY_SECRET")
-    or os.getenv("RAPIDAPI_SECRET", "")
-)
-REQUIRE_RAPIDAPI_PROXY_SECRET = os.getenv("REQUIRE_RAPIDAPI_PROXY_SECRET", "false").lower() == "true"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # ── Logging ───────────────────────────────────────────────
@@ -70,32 +68,6 @@ app.add_middleware(
 )
 
 secure_headers = Secure()
-
-# ── RapidAPI Validation Middleware ────────────────────────
-@app.middleware("http")
-async def rapidapi_validation(request: Request, call_next):
-    if (
-        request.method == "OPTIONS"
-        or request.url.path in {"/", "/health", "/plan", "/v1/plan"}
-        or request.url.path.startswith("/auth/")
-        or request.url.path.startswith("/v1/auth/")
-    ):
-        return await call_next(request)
-
-    if request.headers.get("authorization", "").strip().lower().startswith("bearer "):
-        return await call_next(request)
-
-    if (
-        REQUIRE_RAPIDAPI_PROXY_SECRET
-        and request.headers.get("x-rapidapi-proxy-secret") != RAPIDAPI_PROXY_SECRET
-    ):
-        return JSONResponse(
-            status_code=403,
-            content={"error": "Invalid proxy secret"},
-        )
-
-    return await call_next(request)
-
 
 # ── Auth Middleware ───────────────────────────────────────
 app.middleware("http")(verify_rapidapi)
@@ -164,18 +136,20 @@ async def body_limit_middleware(request: Request, call_next):
 # ── Rate Limit Handler ────────────────────────────────────
 @app.exception_handler(RateLimitExceeded)
 def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    plan = getattr(request.state, "plan", "free")
-
+    plan = getattr(request.state, "plan", DEFAULT_PLAN)
     msgs = {
-        "free": "5 requests/minute",
-        "basic": "20 requests/minute",
-        "pro": "60 requests/minute",
-        "ultra": "120 requests/minute",
+        name: limit.replace("/minute", " requests/minute")
+        for name, limit in RATE_LIMITS.items()
     }
 
     return JSONResponse(
         status_code=429,
-        content={"error": f"Rate limit exceeded: {msgs.get(plan, '5 requests/minute')}"},
+        content={
+            "error": (
+                f"Rate limit exceeded: "
+                f"{msgs.get(plan, msgs[DEFAULT_PLAN])}"
+            )
+        },
     )
 
 
@@ -335,7 +309,7 @@ async def humanize(
     if len(words) > PLAN_LIMITS[plan]["per_request"]:
         raise HTTPException(status_code=400, detail="Word limit exceeded")
 
-    word_count = len(words)
+    word_count = count_words(clean_text)
 
     # Redis quota tracking
     now = datetime.now(timezone.utc)

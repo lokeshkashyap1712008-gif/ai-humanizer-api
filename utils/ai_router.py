@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 _MODEL = "claude-sonnet-4-6"
 _TIMEOUT = 20
 MAX_RETRIES = 2
-_MAX_OUTPUT_RATIO = 2.5
+_MAX_OUTPUT_RATIO = 3.5
 
 _API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
@@ -128,6 +128,20 @@ def _clean_output(text: str, raw_len: int) -> str:
     return text
 
 
+def _extract_response_text(response) -> str:
+    chunks = []
+    for part in response.content or []:
+        text = getattr(part, "text", None)
+        if text:
+            chunks.append(text)
+            continue
+
+        if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+            chunks.append(part["text"])
+
+    return "\n".join(chunks).strip()
+
+
 # ── Local Fallback ─────────────────────────────────────────
 def _fallback(text: str, mode: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
@@ -155,10 +169,10 @@ async def _call_claude(prompt: str, plan: str, raw_len: int) -> str:
                 timeout=_TIMEOUT,
             )
 
-            if not response.content:
+            output = _extract_response_text(response)
+            if not output:
                 raise Exception("ai_error")
 
-            output = response.content[0].text
             return _clean_output(output, raw_len)
 
         except asyncio.TimeoutError:

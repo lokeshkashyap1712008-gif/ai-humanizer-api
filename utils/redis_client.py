@@ -65,12 +65,15 @@ class _InMemoryRedis:
             return True
 
     async def eval(self, _script: str, _numkeys: int, key: str, *args: str) -> int:
-        """Execute Lua-like quota script with variable args (limit, [add], expiry)."""
+        """Execute supported quota scripts with args: (limit, expiry) or (limit, add, expiry)."""
+        if len(args) not in {2, 3}:
+            raise ValueError("Unsupported Redis eval argument shape")
+
         monthly_limit = int(args[0])
         expiry_ts = int(args[-1])
         now_ts = int(time.time())
 
-        # Determine increment (for words) or 1 (for requests)
+        # Words script passes an explicit increment; requests script increments by one.
         increment = int(args[1]) if len(args) > 2 else 1
 
         if increment < 0 or monthly_limit < 0:

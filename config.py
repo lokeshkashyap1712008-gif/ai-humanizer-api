@@ -87,6 +87,7 @@ PLAN_MODE_ACCESS: Dict[str, Set[str]] = {
 
 
 VALID_PLANS = frozenset(PLAN_CONFIG.keys())
+DEFAULT_PLAN = "basic"
 
 
 # ── Character Limits (Anti-abuse) ──────────────────────────

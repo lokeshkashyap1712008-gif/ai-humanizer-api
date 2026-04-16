@@ -8,7 +8,7 @@ import os
 import redis as sync_redis
 from dotenv import load_dotenv
 from slowapi import Limiter
-from config import STRICT_EXTERNALS, APP_ENV, RATE_LIMITS
+from config import DEFAULT_PLAN, STRICT_EXTERNALS, APP_ENV, RATE_LIMITS
 
 load_dotenv()
 
@@ -69,7 +69,7 @@ def get_user_identifier(request) -> str:
 
     api_key = headers.get("x-rapidapi-key")
     user_id = getattr(request.state, "user_id", None)
-    plan = getattr(request.state, "plan", "basic")
+    plan = getattr(request.state, "plan", DEFAULT_PLAN)
 
     if api_key:
         # Use hashed API key to avoid key exposure in Redis
@@ -96,11 +96,11 @@ def get_rate_limit(key: str) -> str:
     try:
         # rl:v1:plan:user
         parts = key.split(":")
-        plan = parts[2] if len(parts) >= 3 else "free"
+        plan = parts[2] if len(parts) >= 3 else DEFAULT_PLAN
     except Exception:
-        plan = "free"
+        plan = DEFAULT_PLAN
 
-    return RATE_LIMITS.get(plan, RATE_LIMITS["free"])
+    return RATE_LIMITS.get(plan, RATE_LIMITS[DEFAULT_PLAN])
 
 
 # ── Limiter Instance ───────────────────────────────────────
