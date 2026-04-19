@@ -19,7 +19,7 @@ from middleware.rate_limit import limiter, get_rate_limit
 from utils.sanitize import sanitize_text, InjectionDetected
 from utils.post_process import humanize_post_process
 from utils.tokens import count_words, get_month_key, get_month_expiry
-from utils.ai_router import AIUnavailableError, generate_humanized_text
+from utils.ai_router import generate_humanized_text
 from utils.redis_client import get_redis
 from routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router
 from utils.jwt_utils import get_jwt_secret
