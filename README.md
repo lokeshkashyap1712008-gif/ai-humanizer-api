@@ -1,58 +1,61 @@
 # AI Humanizer API
 
-Convert AI-generated text into more natural writing with per-plan limits and authentication.
+Convert AI-generated text into more natural writing with plan-based word and request quotas.
 
-## Endpoints
+## API Endpoints
 
+### Core (v1)
+- `POST /v1/humanize`
+- `GET /v1/usage`
+- `GET /v1/plan`
+
+### Legacy aliases (still supported)
 - `POST /humanize`
-- `POST /auth/signup`
-- `POST /auth/login`
-- `GET /auth/me`
+- `GET /usage`
+- `GET /plan`
+
+### Auth
+- `POST /v1/auth/signup`
+- `POST /v1/auth/login`
+- `GET /v1/auth/me`
+- `POST /auth/signup` (legacy)
+- `POST /auth/login` (legacy)
+- `GET /auth/me` (legacy)
+
+### Health
 - `GET /health`
 
-## Auth Modes
+## Authentication
 
-`/humanize` accepts two auth styles:
+`/humanize` and `/v1/humanize` accept two auth modes:
 
 1. RapidAPI headers
-- `x-rapidapi-key`
-- `x-rapidapi-host`
-- `x-rapidapi-subscription` (plan from RapidAPI)
+- `x-rapidapi-key` (required)
+- `x-rapidapi-host` (recommended)
+- `x-rapidapi-subscription` (`basic|pro|ultra|mega`)
 - optional `x-rapidapi-user`
-- optional `x-rapidapi-proxy-secret` (required only if enabled by env)
+- optional `x-rapidapi-proxy-secret` (required only if `REQUIRE_RAPIDAPI_PROXY_SECRET=true`)
 
-2. JWT bearer token
+2. Bearer token (JWT)
 - `Authorization: Bearer <token>`
-- token comes from `/auth/login` or `/auth/signup`
+- token is issued by `/auth/login` or `/auth/signup`
 
-## Which plan is used
+## How plan is resolved
 
 1. If `Authorization: Bearer ...` is present:
-- Token is decoded (`JWT_SECRET`, `JWT_ALGORITHM`)
-- User is loaded from Redis
-- Plan comes from stored user record (`user.plan`)
+- JWT is validated
+- user is loaded from Redis
+- plan comes from stored user record
 
 2. If no bearer token:
-- RapidAPI middleware validates standard RapidAPI headers
-- Plan comes from `x-rapidapi-subscription`
-- Unknown plans are downgraded to `free`
+- RapidAPI middleware validates headers
+- plan comes from `x-rapidapi-subscription`
+- invalid/missing plan defaults to `basic`
 
-## JWT details
-
-Access token payload:
-- `userId`
-- `iat` (issued-at unix timestamp)
-- `exp` (expiry unix timestamp)
-
-Config:
-- `JWT_SECRET` (required)
-- `JWT_ALGORITHM` (default `HS256`)
-- `JWT_EXPIRES_IN_HOURS` (default `24`)
-
-## Request example
+## Humanize request example
 
 ```http
-POST /humanize
+POST /v1/humanize
 Authorization: Bearer <token>
 Content-Type: application/json
 
@@ -62,7 +65,7 @@ Content-Type: application/json
 }
 ```
 
-## Response example
+## Humanize response example
 
 ```json
 {
@@ -80,19 +83,29 @@ Content-Type: application/json
   "quota": {
     "words_used": 500,
     "words_limit": 10000,
-    "words_remaining": 9500
+    "words_remaining": 9500,
+    "requests_used": 25,
+    "requests_limit": 500000,
+    "requests_remaining": 499975
   }
 }
 ```
 
-If `fallback_used` is `true`, AI provider failed and local fallback logic was used.
+If `fallback_used` is `true`, provider generation failed and local fallback rewriting was used.
+
+## Usage endpoint response
+
+`GET /v1/usage` (or `/usage`) returns current month usage:
+- words used/limit/remaining
+- requests used/limit/remaining
+- plan limits and available modes
 
 ## Plans
 
-- `free`: 500 words/month, 500 words/request, mode `standard`
-- `basic`: 10,000 words/month, 2,000 words/request, all modes
-- `pro`: 50,000 words/month, 5,000 words/request, all modes
-- `ultra`: 250,000 words/month, 15,000 words/request, all modes
+- `basic`: 500 words/month, 500 requests/month, 500 words/request, mode `standard`
+- `pro`: 10,000 words/month, 500,000 requests/month, 2,000 words/request, all modes
+- `ultra`: 50,000 words/month, 500,000 requests/month, 5,000 words/request, all modes
+- `mega`: 250,000 words/month, 500,000 requests/month, 15,000 words/request, all modes
 
 ## Modes
 
@@ -101,28 +114,19 @@ If `fallback_used` is `true`, AI provider failed and local fallback logic was us
 - `academic`
 - `casual`
 
-## Validate current JWT user
-
-Use `GET /auth/me` with bearer token to confirm:
-- current user id
-- email
-- active plan
-- allowed modes
-- monthly/per-request limits
-
 ## Important environment variables
 
+- `RAPIDAPI_PROXY_SECRET` (or `RAPIDAPI_SECRET`)
+- `REQUIRE_RAPIDAPI_PROXY_SECRET`
 - `ANTHROPIC_API_KEY`
-- `ANTHROPIC_MODEL` (optional, default `claude-3-5-sonnet-latest`)
+- `ANTHROPIC_MODEL` (default `claude-3-5-sonnet-latest`)
 - `ALLOW_LOCAL_FALLBACK` (`true` or `false`)
-- `JWT_SECRET`
+- `JWT_SECRET` (minimum 32 chars)
 - `JWT_ALGORITHM`
 - `JWT_EXPIRES_IN_HOURS`
+- `UPSTASH_REDIS_URL`
 - `UPSTASH_REDIS_REST_URL`
 - `UPSTASH_REDIS_REST_TOKEN`
-- `UPSTASH_REDIS_URL` (rate limiter backend)
-- `REQUIRE_RAPIDAPI_PROXY_SECRET`
-- `RAPIDAPI_PROXY_SECRET` or `RAPIDAPI_SECRET`
 
 ## Errors
 
@@ -130,6 +134,6 @@ Use `GET /auth/me` with bearer token to confirm:
 - `401` unauthorized
 - `403` mode not allowed for plan
 - `408` timeout
-- `429` rate or monthly quota exceeded
-- `502` AI error/unavailable
+- `429` rate limit or monthly quota exceeded
+- `502` AI unavailable/error
 - `503` backend unavailable

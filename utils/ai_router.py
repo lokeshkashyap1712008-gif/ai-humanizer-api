@@ -31,7 +31,7 @@ _DEFAULT_MODEL = "claude-3-5-sonnet-latest"
 _MODEL = (os.getenv("ANTHROPIC_MODEL") or _DEFAULT_MODEL).strip()
 _TIMEOUT = 20
 MAX_RETRIES = 2
-_MAX_OUTPUT_RATIO = 2.5
+_MAX_OUTPUT_RATIO = 3.5
 _ALLOW_LOCAL_FALLBACK = os.getenv("ALLOW_LOCAL_FALLBACK", "true").strip().lower() in {
     "1",
     "true",
@@ -69,7 +69,6 @@ class GenerationResult:
     fallback_reason: str = ""
 
 
-# System Prompt
 _SYSTEM_PROMPT = (
     "You are not an AI assistant. You are a human writer editing your own draft. "
     "The text you receive is already written. Your job is not to improve it, optimize it, or make it better. "
@@ -92,7 +91,6 @@ _SYSTEM_PROMPT = (
     "Do not explain anything. Do not mention editing. Output only the final text."
 )
 
-# Mode Instructions
 _MODE = {
     "standard": (
         "Keep it mostly similar, but introduce subtle irregularities. "
@@ -114,7 +112,6 @@ _MODE = {
     ),
 }
 
-# Variation Pool
 _VARIATIONS = [
     "Let the main point of one sentence arrive later than expected, do not lead with it.",
     "Write one sentence that is four words or fewer and place it where it creates a small pause.",
@@ -130,15 +127,13 @@ _VARIATIONS = [
     "Introduce a mild tonal shift mid-paragraph, then return.",
 ]
 
-# Token Limits
 _MAX_TOKENS = {
-    "free": 800,
-    "basic": 1500,
-    "pro": 5000,
-    "ultra": 12000,
+    "basic": 800,
+    "pro": 1500,
+    "ultra": 5000,
+    "mega": 12000,
 }
 
-# Output Safety
 _HTML_TAG_RE = re.compile(r"<[^>]{0,200}>")
 
 
@@ -152,6 +147,20 @@ def _clean_output(text: str, raw_len: int) -> str:
         logger.warning("AI output exceeded safe ratio")
         raise AIUnavailableError("ai_output_ratio_exceeded")
     return clean
+
+
+def _extract_response_text(response) -> str:
+    chunks = []
+    for part in response.content or []:
+        text = getattr(part, "text", None)
+        if text:
+            chunks.append(text)
+            continue
+
+        if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+            chunks.append(part["text"])
+
+    return "\n".join(chunks).strip()
 
 
 def _fallback(text: str, mode: str) -> str:
@@ -184,9 +193,12 @@ async def _call_claude(prompt: str, plan: str, raw_len: int) -> str:
                 ),
                 timeout=_TIMEOUT,
             )
-            if not response.content:
+
+            output = _extract_response_text(response)
+            if not output:
                 raise AIUnavailableError("empty_response")
-            return _clean_output(response.content[0].text, raw_len)
+
+            return _clean_output(output, raw_len)
         except asyncio.TimeoutError as exc:
             if attempt == MAX_RETRIES:
                 raise AIUnavailableError("timeout") from exc

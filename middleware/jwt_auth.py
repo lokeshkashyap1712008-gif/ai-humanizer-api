@@ -1,7 +1,7 @@
 from fastapi import HTTPException, Request, status
 from jwt import ExpiredSignatureError, InvalidTokenError
 
-from config import VALID_PLANS
+from config import DEFAULT_PLAN, VALID_PLANS
 from controllers.auth_controller import get_user_by_id
 from utils.jwt_utils import decode_access_token
 
@@ -55,9 +55,9 @@ async def require_authenticated_user(request: Request) -> str:
 
         user_doc = await get_user_by_id(user_id)
 
-        plan = str(user_doc.get("plan") or "free").lower()
+        plan = str(user_doc.get("plan") or DEFAULT_PLAN).lower()
         if plan not in VALID_PLANS:
-            plan = "free"
+            plan = DEFAULT_PLAN
 
         request.state.user_id = user_id
         request.state.plan = plan

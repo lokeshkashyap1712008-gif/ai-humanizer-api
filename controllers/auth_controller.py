@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import bcrypt
 from fastapi import HTTPException, status
 
-from config import VALID_PLANS
+from config import DEFAULT_PLAN, VALID_PLANS
 from utils.jwt_utils import issue_access_token
 from utils.redis_client import get_redis
 
@@ -69,11 +69,11 @@ def _issue_token(user_id: str) -> str:
         )
 
 
-async def signup_user(email: str, password: str, plan: str = "free") -> dict:
+async def signup_user(email: str, password: str, plan: str = DEFAULT_PLAN) -> dict:
     normalized_email = _normalize_email(email)
     validated_password = _validate_password(password)
 
-    normalized_plan = (plan or "free").strip().lower()
+    normalized_plan = (plan or DEFAULT_PLAN).strip().lower()
     if normalized_plan not in VALID_PLANS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -161,7 +161,7 @@ async def login_user(email: str, password: str) -> dict:
         "user": {
             "userId": user_doc.get("user_id"),
             "email": user_doc.get("email"),
-            "plan": user_doc.get("plan", "free"),
+            "plan": user_doc.get("plan", DEFAULT_PLAN),
         },
     }
 

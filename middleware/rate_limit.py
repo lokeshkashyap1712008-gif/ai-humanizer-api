@@ -8,7 +8,7 @@ import os
 import redis as sync_redis
 from dotenv import load_dotenv
 from slowapi import Limiter
-from config import STRICT_EXTERNALS, APP_ENV, RATE_LIMITS
+from config import DEFAULT_PLAN, STRICT_EXTERNALS, APP_ENV, RATE_LIMITS
 
 load_dotenv()
 
@@ -62,21 +62,26 @@ def get_user_identifier(request) -> str:
     Priority:
     1. RapidAPI key (best)
     2. user_id (fallback)
-    3. IP (last resort)
+    3. IP (last resort - only for public endpoints)
     """
 
     headers = request.headers
 
     api_key = headers.get("x-rapidapi-key")
     user_id = getattr(request.state, "user_id", None)
-    plan = getattr(request.state, "plan", "free")
+    plan = getattr(request.state, "plan", DEFAULT_PLAN)
 
     if api_key:
-        identity = api_key
+        # Use hashed API key to avoid key exposure in Redis
+        import hashlib
+        identity = hashlib.sha256(api_key.encode()).hexdigest()[:16]
     elif user_id:
         identity = user_id
+    elif request.client:
+        # Only use IP for public endpoints with no auth
+        identity = request.client.host
     else:
-        identity = request.client.host if request.client else "unknown"
+        identity = "unknown"
 
     # Namespaced key (future-proof)
     return f"rl:v1:{plan}:{identity}"
@@ -91,11 +96,11 @@ def get_rate_limit(key: str) -> str:
     try:
         # rl:v1:plan:user
         parts = key.split(":")
-        plan = parts[2] if len(parts) >= 3 else "free"
+        plan = parts[2] if len(parts) >= 3 else DEFAULT_PLAN
     except Exception:
-        plan = "free"
+        plan = DEFAULT_PLAN
 
-    return RATE_LIMITS.get(plan, RATE_LIMITS["free"])
+    return RATE_LIMITS.get(plan, RATE_LIMITS[DEFAULT_PLAN])
 
 
 # ── Limiter Instance ───────────────────────────────────────

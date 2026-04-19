@@ -25,23 +25,21 @@ from utils.post_process import humanize_post_process
 from utils.tokens import count_words, get_month_key, get_month_expiry
 from utils.ai_router import AIUnavailableError, generate_humanized_text
 from utils.redis_client import get_redis
-from routes.auth_routes import router as auth_router
+from routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router
 from config import (
+    DEFAULT_PLAN,
+    PLAN_CONFIG,
     PLAN_LIMITS,
     PLAN_CHAR_LIMITS,
     MAX_WORD_LEN,
     PLAN_MODE_ACCESS,
+    RATE_LIMITS,
     VALID_PLANS,
 )
 
 # ── Config ────────────────────────────────────────────────
 MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", 50 * 1024))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
-RAPIDAPI_PROXY_SECRET = (
-    os.getenv("RAPIDAPI_PROXY_SECRET")
-    or os.getenv("RAPIDAPI_SECRET", "")
-)
-REQUIRE_RAPIDAPI_PROXY_SECRET = os.getenv("REQUIRE_RAPIDAPI_PROXY_SECRET", "false").lower() == "true"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # ── Logging ───────────────────────────────────────────────
@@ -54,6 +52,7 @@ logger = logging.getLogger(__name__)
 # ── App Init ──────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None)
 app.include_router(auth_router)
+app.include_router(auth_legacy_router)
 
 AUTH_DEBUG_VERSION = "rapidapi-auth-debug-v2"
 logger.info("Starting app with %s", AUTH_DEBUG_VERSION)
@@ -69,31 +68,6 @@ app.add_middleware(
 )
 
 secure_headers = Secure()
-
-# ── RapidAPI Validation Middleware ────────────────────────
-@app.middleware("http")
-async def rapidapi_validation(request: Request, call_next):
-    if (
-        request.method == "OPTIONS"
-        or request.url.path in {"/", "/health"}
-        or request.url.path.startswith("/auth/")
-    ):
-        return await call_next(request)
-
-    if request.headers.get("authorization", "").strip().lower().startswith("bearer "):
-        return await call_next(request)
-
-    if (
-        REQUIRE_RAPIDAPI_PROXY_SECRET
-        and request.headers.get("x-rapidapi-proxy-secret") != RAPIDAPI_PROXY_SECRET
-    ):
-        return JSONResponse(
-            status_code=403,
-            content={"error": "Invalid proxy secret"},
-        )
-
-    return await call_next(request)
-
 
 # ── Auth Middleware ───────────────────────────────────────
 app.middleware("http")(verify_rapidapi)
@@ -162,18 +136,20 @@ async def body_limit_middleware(request: Request, call_next):
 # ── Rate Limit Handler ────────────────────────────────────
 @app.exception_handler(RateLimitExceeded)
 def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    plan = getattr(request.state, "plan", "free")
-
+    plan = getattr(request.state, "plan", DEFAULT_PLAN)
     msgs = {
-        "free": "5 requests/minute",
-        "basic": "20 requests/minute",
-        "pro": "60 requests/minute",
-        "ultra": "120 requests/minute",
+        name: limit.replace("/minute", " requests/minute")
+        for name, limit in RATE_LIMITS.items()
     }
 
     return JSONResponse(
         status_code=429,
-        content={"error": f"Rate limit exceeded: {msgs.get(plan, '5 requests/minute')}"},
+        content={
+            "error": (
+                f"Rate limit exceeded: "
+                f"{msgs.get(plan, msgs[DEFAULT_PLAN])}"
+            )
+        },
     )
 
 
@@ -212,8 +188,9 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-# ── Lua Script (Quota System) ─────────────────────────────
-_BUDGET_LUA = """
+# ── Lua Scripts (Quota System) ─────────────────────────────
+# Words quota tracking
+_WORDS_BUDGET_LUA = """
 local key      = KEYS[1]
 local limit    = tonumber(ARGV[1])
 local add      = tonumber(ARGV[2])
@@ -226,6 +203,28 @@ if current + add > limit then
 end
 
 local new_total = redis.call('INCRBY', key, add)
+
+local expiry_ok = redis.call('EXPIREAT', key, expiry)
+if expiry_ok == 0 then
+    return -2
+end
+
+return new_total
+"""
+
+# Requests quota tracking
+_REQUESTS_BUDGET_LUA = """
+local key      = KEYS[1]
+local limit    = tonumber(ARGV[1])
+local expiry   = tonumber(ARGV[2])
+
+local current  = tonumber(redis.call('GET', key) or 0)
+
+if current + 1 > limit then
+    return -1
+end
+
+local new_total = redis.call('INCR', key)
 
 local expiry_ok = redis.call('EXPIREAT', key, expiry)
 if expiry_ok == 0 then
@@ -265,8 +264,11 @@ async def health():
         )
 
 
-# ── Main Route ────────────────────────────────────────────
-@app.post("/humanize")
+# ── v1 API Routes ─────────────────────────────────────────
+# All core endpoints are prefixed with /v1 for version management
+
+@app.post("/v1/humanize")
+@app.post("/humanize")  # Legacy support (deprecated, will be removed in v2)
 @limiter.limit(get_rate_limit)
 async def humanize(
     request: Request,
@@ -308,30 +310,53 @@ async def humanize(
     if len(words) > PLAN_LIMITS[plan]["per_request"]:
         raise HTTPException(status_code=400, detail="Word limit exceeded")
 
-    word_count = len(words)
+    word_count = count_words(clean_text)
 
-    # Redis quota
+    # Redis quota tracking
     now = datetime.now(timezone.utc)
     redis = get_redis()
-    key = get_month_key(user_id, now)
+    month_expiry = get_month_expiry(now)
 
+    # Track words quota
+    words_key = get_month_key(user_id, now)
     try:
-        result = await redis.eval(
-            _BUDGET_LUA,
+        words_result = await redis.eval(
+            _WORDS_BUDGET_LUA,
             1,
-            key,
-            str(PLAN_LIMITS[plan]["monthly"]),
+            words_key,
+            str(PLAN_LIMITS[plan]["monthly_words"]),
             str(word_count),
-            str(get_month_expiry(now)),
+            str(month_expiry),
         )
-        result = int(result)
+        words_result = int(words_result)
     except Exception:
         raise HTTPException(status_code=503, detail="Service unavailable")
 
-    if result == -1:
-        raise HTTPException(status_code=429, detail="Monthly limit exceeded")
+    if words_result == -1:
+        raise HTTPException(status_code=429, detail="Monthly word limit exceeded")
 
-    if result == -2:
+    if words_result == -2:
+        raise HTTPException(status_code=503, detail="Quota system error")
+
+    # Track request quota
+    requests_key = f"req:{user_id}:{now.year}-{now.month:02d}"
+    try:
+        requests_result = await redis.eval(
+            _REQUESTS_BUDGET_LUA,
+            1,
+            requests_key,
+            str(PLAN_LIMITS[plan]["monthly_requests"]),
+            str(month_expiry),
+        )
+        requests_result = int(requests_result)
+    except Exception:
+        # Don't fail the request if request tracking fails, but log it
+        logger.error("Request quota tracking failed request_id=%s", request_id)
+        requests_result = 0
+
+    if requests_result == -1:
+        raise HTTPException(status_code=429, detail="Monthly request limit exceeded")
+    if requests_result == -2:
         raise HTTPException(status_code=503, detail="Quota system error")
 
     # AI call
@@ -351,11 +376,13 @@ async def humanize(
         post_processed = generation.text
     else:
         post_processed = humanize_post_process(generation.text, body.mode)
-    monthly_limit = PLAN_LIMITS[plan]["monthly"]
-    words_remaining = max(monthly_limit - result, 0)
+    monthly_word_limit = PLAN_LIMITS[plan]["monthly_words"]
+    monthly_request_limit = PLAN_LIMITS[plan]["monthly_requests"]
+    words_remaining = max(monthly_word_limit - words_result, 0)
+    requests_remaining = max(monthly_request_limit - requests_result, 0)
 
-    # Response
-    return {
+    # Build response with RapidAPI compliant headers
+    response_data = {
         "success": True,
         "humanized_text": post_processed,
         "original_word_count": word_count,
@@ -368,8 +395,104 @@ async def humanize(
             "fallback_reason": generation.fallback_reason,
         },
         "quota": {
-            "words_used": result,
-            "words_limit": monthly_limit,
+            "words_used": words_result,
+            "words_limit": monthly_word_limit,
             "words_remaining": words_remaining,
+            "requests_used": requests_result,
+            "requests_limit": monthly_request_limit,
+            "requests_remaining": requests_remaining,
         },
+    }
+
+    # Add RapidAPI-style rate limit headers
+    headers = {
+        "X-Ratelimit-Limit": str(monthly_request_limit),
+        "X-Ratelimit-Remaining": str(requests_remaining),
+        "X-Ratelimit-Reset": str(month_expiry),
+    }
+
+    return JSONResponse(content=response_data, headers=headers)
+
+
+# ── Usage Endpoint ─────────────────────────────────────────
+@app.get("/v1/usage")
+@app.get("/usage")  # Legacy support
+@limiter.limit(get_rate_limit)
+async def get_usage(
+    request: Request,
+    _auth_user: str = Depends(require_authenticated_user),
+):
+    """Get current usage statistics for the authenticated user."""
+    if not hasattr(request.state, "plan") or request.state.plan not in VALID_PLANS:
+        raise HTTPException(status_code=401, detail="Invalid subscription plan")
+
+    user_id = request.state.user_id
+    plan = request.state.plan
+
+    now = datetime.now(timezone.utc)
+    redis = get_redis()
+    month_expiry = get_month_expiry(now)
+
+    # Get current usage from Redis
+    words_key = get_month_key(user_id, now)
+    requests_key = f"req:{user_id}:{now.year}-{now.month:02d}"
+
+    try:
+        words_used = int(await redis.get(words_key) or 0)
+        requests_used = int(await redis.get(requests_key) or 0)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+
+    plan_limits = PLAN_LIMITS[plan]
+    words_remaining = max(plan_limits["monthly_words"] - words_used, 0)
+    requests_remaining = max(plan_limits["monthly_requests"] - requests_used, 0)
+
+    response_data = {
+        "plan": plan,
+        "period": f"{now.year}-{now.month:02d}",
+        "quotas": {
+            "words": {
+                "used": words_used,
+                "limit": plan_limits["monthly_words"],
+                "remaining": words_remaining,
+            },
+            "requests": {
+                "used": requests_used,
+                "limit": plan_limits["monthly_requests"],
+                "remaining": requests_remaining,
+            },
+        },
+        "limits": {
+            "per_request_words": plan_limits["per_request"],
+            "available_modes": list(PLAN_MODE_ACCESS[plan]),
+        },
+    }
+
+    headers = {
+        "X-Ratelimit-Limit": str(plan_limits["monthly_requests"]),
+        "X-Ratelimit-Remaining": str(requests_remaining),
+        "X-Ratelimit-Reset": str(month_expiry),
+    }
+
+    return JSONResponse(content=response_data, headers=headers)
+
+
+# ── Plan Info Endpoint ────────────────────────────────────
+@app.get("/v1/plan")
+@app.get("/plan")  # Legacy support
+async def get_plan_info():
+    """Get information about all available plans."""
+    return {
+        "plans": {
+            plan: {
+                "price": cfg["price"],
+                "monthly_words": cfg["monthly_words"],
+                "monthly_requests": cfg["monthly_requests"],
+                "per_request_words": cfg["per_request_words"],
+                "modes": list(cfg["modes"]),
+                "priority": cfg["priority"],
+                "bulk": cfg["bulk"],
+            }
+            for plan, cfg in PLAN_CONFIG.items()
+        }
     }

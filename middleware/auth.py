@@ -13,7 +13,7 @@
 #      prevents memory pressure from oversized header values
 #   ✅ Plan validated against VALID_PLANS whitelist —
 #      spoofed header "x-rapidapi-subscription: god"
-#      is silently downgraded to "free"
+#      is safely downgraded to the default plan
 #   ✅ user_id validated via printable-ASCII regex, capped
 #      at 128 chars — prevents Redis key injection and
 #      CRLF injection via oversized header values
@@ -22,7 +22,7 @@
 #      "anonymous" quota for all unauthenticated callers
 #   ✅ Secret validated at startup — mis-configured deploys
 #      fail immediately rather than silently at runtime
-#   ✅ /health bypasses auth (required for RapidAPI probes)
+#   ✅ Public health, plan, and auth routes bypass RapidAPI auth
 # ============================================================
 
 import hashlib
@@ -35,7 +35,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-from config import VALID_PLANS
+from config import DEFAULT_PLAN, VALID_PLANS
 
 load_dotenv()
 
@@ -55,8 +55,8 @@ _SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
 
 # Cap incoming secret header length before comparison to prevent memory pressure
 _MAX_SECRET_LEN = 512
-_PUBLIC_PATHS = {"/", "/health"}
-_PUBLIC_PREFIXES = ("/auth/",)
+_PUBLIC_PATHS = {"/", "/health", "/plan", "/v1/plan"}
+_PUBLIC_PREFIXES = ("/auth/", "/v1/auth/")
 
 
 def _is_public_path(path: str) -> bool:
@@ -92,7 +92,7 @@ async def verify_rapidapi(request: Request, call_next):
     raw_api_key  = request.headers.get("x-rapidapi-key", "")
     raw_host     = request.headers.get("x-rapidapi-host", "")
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
-    raw_plan     = request.headers.get("x-rapidapi-subscription", "free").lower()
+    raw_plan     = request.headers.get("x-rapidapi-subscription", DEFAULT_PLAN).lower()
 
     logger.info(
         "rapidapi_auth request path=%s method=%s has_proxy_secret=%s secret_len=%s has_key=%s has_host=%s has_user=%s plan=%s",
@@ -106,7 +106,7 @@ async def verify_rapidapi(request: Request, call_next):
         raw_plan,
     )
 
-    if not raw_api_key or not raw_host:
+    if not raw_api_key:
         logger.warning(
             "rapidapi_auth reject reason=missing_standard_headers path=%s has_key=%s has_host=%s",
             request.url.path,
@@ -119,11 +119,18 @@ async def verify_rapidapi(request: Request, call_next):
     # RapidAPI guarantees x-rapidapi-key + x-rapidapi-host for proxy traffic.
     # Validate the proxy secret only when explicitly required, or when both
     # a configured secret and a request secret are present.
-    should_validate_secret = bool(raw_secret) and (
-        REQUIRE_RAPIDAPI_PROXY_SECRET or bool(RAPIDAPI_SECRET)
+    should_validate_secret = REQUIRE_RAPIDAPI_PROXY_SECRET or (
+        bool(raw_secret) and bool(RAPIDAPI_SECRET)
     )
 
     if should_validate_secret:
+        if REQUIRE_RAPIDAPI_PROXY_SECRET and not raw_secret:
+            logger.warning(
+                "rapidapi_auth reject reason=missing_proxy_secret path=%s",
+                request.url.path,
+            )
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
         # Cap length first to avoid hashing a multi-MB attacker-supplied string.
         if len(raw_secret) > _MAX_SECRET_LEN:
             logger.warning(
@@ -152,7 +159,7 @@ async def verify_rapidapi(request: Request, call_next):
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     # ── Plan whitelist ─────────────────────────────────────
-    plan = raw_plan if raw_plan in VALID_PLANS else "free"
+    plan = raw_plan if raw_plan in VALID_PLANS else DEFAULT_PLAN
 
     # ── Sanitize user_id ───────────────────────────────────
     if _SAFE_ID_RE.match(raw_user_id):

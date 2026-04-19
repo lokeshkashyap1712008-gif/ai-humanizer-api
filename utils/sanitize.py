@@ -93,8 +93,8 @@ def sanitize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    text = re.sub(r'```.*?```', '[removed]', text, flags=re.DOTALL)
-    text = re.sub(r'`[^`]{0,500}`', '[removed]', text)
+    text = re.sub(r"```[^\n`]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]{0,500})`", r"\1", text)
 
     if len(text) > 40:
         text = _B64_RE.sub(_check_b64_blob, text)
