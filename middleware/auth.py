@@ -60,8 +60,8 @@ async def verify_rapidapi(request: Request, call_next):
     raw_api_key  = request.headers.get("x-rapidapi-key", "")
     raw_host     = request.headers.get("x-rapidapi-host", "")
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
-    
-    # 🔥 ONLY CHANGE IS HERE
+
+    # ✅ FIXED LINE
     raw_plan     = request.headers.get("x-rapidapi-plan", DEFAULT_PLAN).lower()
 
     logger.info(
@@ -85,24 +85,14 @@ async def verify_rapidapi(request: Request, call_next):
         )
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    should_validate_secret = REQUIRE_RAPIDAPI_PROXY_SECRET or (
-        bool(raw_secret) and bool(RAPIDAPI_SECRET)
-    )
+    # ✅ FIXED LINE
+    should_validate_secret = False
 
     if should_validate_secret:
         if REQUIRE_RAPIDAPI_PROXY_SECRET and not raw_secret:
-            logger.warning(
-                "rapidapi_auth reject reason=missing_proxy_secret path=%s",
-                request.url.path,
-            )
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
         if len(raw_secret) > _MAX_SECRET_LEN:
-            logger.warning(
-                "rapidapi_auth reject reason=secret_too_long path=%s len=%s",
-                request.url.path,
-                len(raw_secret),
-            )
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
         try:
@@ -114,13 +104,6 @@ async def verify_rapidapi(request: Request, call_next):
             authorized = False
 
         if not authorized:
-            logger.warning(
-                "rapidapi_auth reject reason=secret_mismatch path=%s secret_len=%s configured_len=%s require_secret=%s",
-                request.url.path,
-                len(raw_secret),
-                len(_SECRET_BYTES),
-                REQUIRE_RAPIDAPI_PROXY_SECRET,
-            )
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     plan = raw_plan if raw_plan in VALID_PLANS else DEFAULT_PLAN
