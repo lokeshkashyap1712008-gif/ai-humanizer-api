@@ -76,7 +76,7 @@ Content-Type: application/json
   "mode": "standard",
   "generation": {
     "provider_used": "anthropic",
-    "model": "claude-3-5-sonnet-latest",
+    "model": "claude-sonnet-4-20250514",
     "fallback_used": false,
     "fallback_reason": ""
   },
@@ -119,7 +119,7 @@ If `fallback_used` is `true`, provider generation failed and local fallback rewr
 - `RAPIDAPI_PROXY_SECRET` (or `RAPIDAPI_SECRET`)
 - `REQUIRE_RAPIDAPI_PROXY_SECRET`
 - `ANTHROPIC_API_KEY`
-- `ANTHROPIC_MODEL` (default `claude-3-5-sonnet-latest`)
+- `ANTHROPIC_MODEL` (default `claude-sonnet-4-20250514`)
 - `ALLOW_LOCAL_FALLBACK` (`true` or `false`)
 - `JWT_SECRET` (minimum 32 chars)
 - `JWT_ALGORITHM`

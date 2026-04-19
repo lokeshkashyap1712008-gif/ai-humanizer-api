@@ -1,7 +1,3 @@
-# ============================================================
-# main.py — Production FastAPI Entry Point (FINAL)
-# ============================================================
-
 import asyncio
 import logging
 import os
@@ -26,6 +22,7 @@ from utils.tokens import count_words, get_month_key, get_month_expiry
 from utils.ai_router import AIUnavailableError, generate_humanized_text
 from utils.redis_client import get_redis
 from routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router
+from utils.jwt_utils import get_jwt_secret
 from config import (
     DEFAULT_PLAN,
     PLAN_CONFIG,
@@ -68,6 +65,21 @@ app.add_middleware(
 )
 
 secure_headers = Secure()
+
+
+def _validate_startup_configuration() -> None:
+    """
+    Fail fast on configuration that would break authenticated usage in production.
+    """
+    try:
+        get_jwt_secret()
+    except RuntimeError as exc:
+        if os.getenv("STRICT_EXTERNALS", "false").strip().lower() in {"1", "true", "yes", "on"}:
+            raise
+        logger.warning("JWT configuration is not production-ready: %s", exc)
+
+
+_validate_startup_configuration()
 
 # ── Auth Middleware ───────────────────────────────────────
 app.middleware("http")(verify_rapidapi)

@@ -27,7 +27,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "claude-3-5-sonnet-latest"
+_DEFAULT_MODEL = "claude-sonnet-4-20250514"
 _MODEL = (os.getenv("ANTHROPIC_MODEL") or _DEFAULT_MODEL).strip()
 _TIMEOUT = 20
 MAX_RETRIES = 2
