@@ -1,29 +1,6 @@
 # ============================================================
 # middleware/auth.py — RapidAPI Authentication Middleware
 # ============================================================
-# Security measures in this file:
-#   ✅ hmac.compare_digest() — constant-time comparison,
-#      prevents timing-oracle brute-force of RAPIDAPI_SECRET
-#   ✅ Explicit bytes encoding before compare_digest —
-#      FIX: previously compared raw str values; a type
-#      mismatch (str vs bytes) raises TypeError instead of
-#      returning False, which leaks as a 500. Both sides are
-#      now .encode("utf-8") before comparison.
-#   ✅ Proxy-secret length capped before comparison —
-#      prevents memory pressure from oversized header values
-#   ✅ Plan validated against VALID_PLANS whitelist —
-#      spoofed header "x-rapidapi-subscription: god"
-#      is safely downgraded to the default plan
-#   ✅ user_id validated via printable-ASCII regex, capped
-#      at 128 chars — prevents Redis key injection and
-#      CRLF injection via oversized header values
-#   ✅ Anonymous fallback uses per-IP hash — prevents budget
-#      collision DoS where one user exhausts the shared
-#      "anonymous" quota for all unauthenticated callers
-#   ✅ Secret validated at startup — mis-configured deploys
-#      fail immediately rather than silently at runtime
-#   ✅ Public health, plan, and auth routes bypass RapidAPI auth
-# ============================================================
 
 import hashlib
 import hmac
@@ -47,13 +24,10 @@ RAPIDAPI_SECRET = (
 )
 REQUIRE_RAPIDAPI_PROXY_SECRET = os.getenv("REQUIRE_RAPIDAPI_PROXY_SECRET", "false").lower() == "true"
 
-# Encode once at startup — avoids per-request allocation
 _SECRET_BYTES = RAPIDAPI_SECRET.encode("utf-8") if RAPIDAPI_SECRET else b""
 
-# Only printable ASCII, 1–128 chars (blocks null-byte / CRLF injection)
 _SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
 
-# Cap incoming secret header length before comparison to prevent memory pressure
 _MAX_SECRET_LEN = 512
 _PUBLIC_PATHS = {"/", "/health", "/plan", "/v1/plan"}
 _PUBLIC_PREFIXES = ("/auth/", "/v1/auth/")
@@ -64,12 +38,6 @@ def _is_public_path(path: str) -> bool:
 
 
 async def verify_rapidapi(request: Request, call_next):
-    """
-    1. Skip auth for /health (required by RapidAPI health probes)
-    2. Verify proxy secret — constant-time, type-safe bytes comparison
-    3. Whitelist-validate plan — prevents privilege escalation
-    4. Sanitize user_id — prevents Redis key injection
-    """
 
     if request.method == "OPTIONS" or _is_public_path(request.url.path):
         logger.info(
@@ -92,7 +60,9 @@ async def verify_rapidapi(request: Request, call_next):
     raw_api_key  = request.headers.get("x-rapidapi-key", "")
     raw_host     = request.headers.get("x-rapidapi-host", "")
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
-    raw_plan     = request.headers.get("x-rapidapi-subscription", DEFAULT_PLAN).lower()
+    
+    # 🔥 ONLY CHANGE IS HERE
+    raw_plan     = request.headers.get("x-rapidapi-plan", DEFAULT_PLAN).lower()
 
     logger.info(
         "rapidapi_auth request path=%s method=%s has_proxy_secret=%s secret_len=%s has_key=%s has_host=%s has_user=%s plan=%s",
@@ -115,10 +85,6 @@ async def verify_rapidapi(request: Request, call_next):
         )
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    # ── Constant-time secret verification ─────────────────
-    # RapidAPI guarantees x-rapidapi-key + x-rapidapi-host for proxy traffic.
-    # Validate the proxy secret only when explicitly required, or when both
-    # a configured secret and a request secret are present.
     should_validate_secret = REQUIRE_RAPIDAPI_PROXY_SECRET or (
         bool(raw_secret) and bool(RAPIDAPI_SECRET)
     )
@@ -131,7 +97,6 @@ async def verify_rapidapi(request: Request, call_next):
             )
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-        # Cap length first to avoid hashing a multi-MB attacker-supplied string.
         if len(raw_secret) > _MAX_SECRET_LEN:
             logger.warning(
                 "rapidapi_auth reject reason=secret_too_long path=%s len=%s",
@@ -158,10 +123,8 @@ async def verify_rapidapi(request: Request, call_next):
             )
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    # ── Plan whitelist ─────────────────────────────────────
     plan = raw_plan if raw_plan in VALID_PLANS else DEFAULT_PLAN
 
-    # ── Sanitize user_id ───────────────────────────────────
     if _SAFE_ID_RE.match(raw_user_id):
         user_id = raw_user_id
     else:
