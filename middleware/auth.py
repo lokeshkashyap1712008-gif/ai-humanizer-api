@@ -22,7 +22,10 @@ RAPIDAPI_SECRET = (
     os.getenv("RAPIDAPI_PROXY_SECRET")
     or os.getenv("RAPIDAPI_SECRET")
 )
-REQUIRE_RAPIDAPI_PROXY_SECRET = os.getenv("REQUIRE_RAPIDAPI_PROXY_SECRET", "false").lower() == "true"
+
+REQUIRE_RAPIDAPI_PROXY_SECRET = os.getenv(
+    "REQUIRE_RAPIDAPI_PROXY_SECRET", "false"
+).lower() == "true"
 
 _SECRET_BYTES = RAPIDAPI_SECRET.encode("utf-8") if RAPIDAPI_SECRET else b""
 
@@ -34,58 +37,60 @@ _PUBLIC_PREFIXES = ("/auth/", "/v1/auth/")
 
 
 def _is_public_path(path: str) -> bool:
-    return path in _PUBLIC_PATHS or any(path.startswith(prefix) for prefix in _PUBLIC_PREFIXES)
+    return path in _PUBLIC_PATHS or any(
+        path.startswith(prefix) for prefix in _PUBLIC_PREFIXES
+    )
 
 
 async def verify_rapidapi(request: Request, call_next):
 
     if request.method == "OPTIONS" or _is_public_path(request.url.path):
-        logger.info(
-            "rapidapi_auth bypass method=%s path=%s",
-            request.method,
-            request.url.path,
-        )
         return await call_next(request)
 
     auth_header = request.headers.get("authorization", "").strip().lower()
     if auth_header.startswith("bearer "):
-        logger.info(
-            "rapidapi_auth bypass method=%s path=%s reason=bearer_token",
-            request.method,
-            request.url.path,
-        )
         return await call_next(request)
 
+    # ============================
+    # 🔥 FIX 1: Robust API key read
+    # ============================
+    raw_api_key = (
+        request.headers.get("x-rapidapi-key")
+        or request.headers.get("X-RapidAPI-Key")
+        or ""
+    )
+
     raw_secret   = request.headers.get("x-rapidapi-proxy-secret", "")
-    raw_api_key  = request.headers.get("x-rapidapi-key", "")
     raw_host     = request.headers.get("x-rapidapi-host", "")
     raw_user_id  = request.headers.get("x-rapidapi-user", "")
 
-    # ✅ FIXED LINE
-    raw_plan     = request.headers.get("x-rapidapi-plan", DEFAULT_PLAN).lower()
+    # ============================
+    # 🔥 FIX 2: Plan header safe fallback
+    # ============================
+    raw_plan = (
+        request.headers.get("x-rapidapi-plan")
+        or request.headers.get("x-rapidapi-subscription")
+        or DEFAULT_PLAN
+    ).lower()
 
     logger.info(
-        "rapidapi_auth request path=%s method=%s has_proxy_secret=%s secret_len=%s has_key=%s has_host=%s has_user=%s plan=%s",
+        "rapidapi_auth request path=%s has_key=%s has_host=%s has_user=%s plan=%s",
         request.url.path,
-        request.method,
-        bool(raw_secret),
-        len(raw_secret),
         bool(raw_api_key),
         bool(raw_host),
         bool(raw_user_id),
         raw_plan,
     )
 
+    # ============================
+    # 🔥 REQUIRED CHECK
+    # ============================
     if not raw_api_key:
-        logger.warning(
-            "rapidapi_auth reject reason=missing_standard_headers path=%s has_key=%s has_host=%s",
-            request.url.path,
-            bool(raw_api_key),
-            bool(raw_host),
-        )
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    # ✅ FIXED LINE
+    # ============================
+    # 🔥 FIX 3: Disable proxy secret validation
+    # ============================
     should_validate_secret = False
 
     if should_validate_secret:
@@ -106,19 +111,24 @@ async def verify_rapidapi(request: Request, call_next):
         if not authorized:
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
+    # ============================
+    # PLAN VALIDATION
+    # ============================
     plan = raw_plan if raw_plan in VALID_PLANS else DEFAULT_PLAN
 
+    # ============================
+    # USER ID SAFE GENERATION
+    # ============================
     if _SAFE_ID_RE.match(raw_user_id):
         user_id = raw_user_id
     else:
-        user_id = f"key-{hashlib.sha256(raw_api_key.encode('utf-8')).hexdigest()[:16]}"
+        user_id = f"key-{hashlib.sha256(raw_api_key.encode()).hexdigest()[:16]}"
 
     request.state.user_id = user_id
-    request.state.plan    = plan
+    request.state.plan = plan
 
     logger.info(
-        "rapidapi_auth accepted path=%s user_id=%s plan=%s",
-        request.url.path,
+        "rapidapi_auth accepted user_id=%s plan=%s",
         user_id,
         plan,
     )
