@@ -23,7 +23,7 @@ from middleware.rate_limit import limiter, get_rate_limit
 from utils.sanitize import sanitize_text, InjectionDetected
 from utils.post_process import humanize_post_process
 from utils.tokens import count_words, get_month_key, get_month_expiry
-from utils.ai_router import generate_humanized_text
+from utils.ai_router import AIUnavailableError, generate_humanized_text
 from utils.redis_client import get_redis
 from routes.auth_routes import router as auth_router
 from config import (
@@ -336,16 +336,21 @@ async def humanize(
 
     # AI call
     try:
-        humanized = await asyncio.wait_for(
+        generation = await asyncio.wait_for(
             generate_humanized_text(clean_text, body.mode, plan),
             timeout=15,
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=408, detail="AI timeout")
+    except AIUnavailableError as exc:
+        raise HTTPException(status_code=502, detail=f"AI unavailable: {str(exc)}")
     except Exception:
         raise HTTPException(status_code=502, detail="AI error")
 
-    post_processed = humanize_post_process(humanized)
+    if generation.fallback_used:
+        post_processed = generation.text
+    else:
+        post_processed = humanize_post_process(generation.text, body.mode)
     monthly_limit = PLAN_LIMITS[plan]["monthly"]
     words_remaining = max(monthly_limit - result, 0)
 
@@ -356,6 +361,12 @@ async def humanize(
         "original_word_count": word_count,
         "output_word_count": count_words(post_processed),
         "mode": body.mode,
+        "generation": {
+            "provider_used": generation.provider_used,
+            "model": generation.model,
+            "fallback_used": generation.fallback_used,
+            "fallback_reason": generation.fallback_reason,
+        },
         "quota": {
             "words_used": result,
             "words_limit": monthly_limit,
