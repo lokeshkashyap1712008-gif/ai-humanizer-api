@@ -1,7 +1,3 @@
-# ============================================================
-# utils/ai_router.py - AI Router (HARDENED v3)
-# ============================================================
-
 import asyncio
 import logging
 import os
@@ -10,54 +6,15 @@ import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
-
-from config import STRICT_EXTERNALS
-
-try:
-    from anthropic import APIConnectionError, APIStatusError, APITimeoutError, AsyncAnthropic
-    _ANTHROPIC_SDK_AVAILABLE = True
-    _ANTHROPIC_IMPORT_ERROR = ""
-except Exception as exc:
-    APIConnectionError = APIStatusError = APITimeoutError = Exception
-    AsyncAnthropic = None  # type: ignore[assignment]
-    _ANTHROPIC_SDK_AVAILABLE = False
-    _ANTHROPIC_IMPORT_ERROR = str(exc)
+from anthropic import AsyncAnthropic
 
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "claude-sonnet-4-20250514"
-_MODEL = (os.getenv("ANTHROPIC_MODEL") or _DEFAULT_MODEL).strip()
-_TIMEOUT = 20
-MAX_RETRIES = 2
-_MAX_OUTPUT_RATIO = 3.5
-_ALLOW_LOCAL_FALLBACK = os.getenv("ALLOW_LOCAL_FALLBACK", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 _API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
-if _API_KEY and _ANTHROPIC_SDK_AVAILABLE:
-    try:
-        _client = AsyncAnthropic(api_key=_API_KEY)
-    except Exception as exc:
-        if STRICT_EXTERNALS:
-            raise RuntimeError("Anthropic init failed") from exc
-        logger.error("Anthropic init failed, fallback may be used")
-        _client = None
-elif _API_KEY and not _ANTHROPIC_SDK_AVAILABLE:
-    if STRICT_EXTERNALS:
-        raise RuntimeError("Anthropic SDK is unavailable")
-    logger.error("Anthropic SDK import failed, fallback mode is active: %s", _ANTHROPIC_IMPORT_ERROR)
-    _client = None
-else:
-    if STRICT_EXTERNALS:
-        raise RuntimeError("Missing ANTHROPIC_API_KEY")
-    logger.warning("No Anthropic key, fallback mode is active")
-    _client = None
+_client = AsyncAnthropic(api_key=_API_KEY) if _API_KEY else None
 
 
 @dataclass
@@ -66,200 +23,169 @@ class GenerationResult:
     provider_used: str
     model: str
     fallback_used: bool
-    fallback_reason: str = ""
 
 
-_SYSTEM_PROMPT = (
-    "You are not an AI assistant. You are a human writer editing your own draft. "
-    "The text you receive is already written. Your job is not to improve it, optimize it, or make it better. "
-    "Your job is to make it feel like it came from a real person thinking while writing. "
-    "Real human writing is uneven. It is not optimized. It does not follow patterns. "
-    "Some sentences are short. Some drag on longer than they should. Sometimes the point comes late. "
-    "Sometimes it comes too early. Occasionally something feels slightly off, but still natural. "
-    "You must introduce natural imperfection without breaking clarity. "
-    "Avoid symmetry. Avoid rhythm patterns. Avoid consistently clean grammar structures. "
-    "Do not rewrite everything cleanly. In fact, resist the urge to fix things. "
-    "Let the writing feel like a thought being formed in real time. Slight hesitation or change in direction. "
-    "Occasional redundancy or softness. Mild unpredictability in structure. "
-    "Use natural human behaviors: start some sentences with conjunctions like And, But, So; "
-    "occasionally use sentence fragments; slightly vary tone within the same paragraph; "
-    "use contractions naturally but not everywhere; let one sentence feel slightly longer than ideal; "
-    "let another be very short. "
-    "Very important: do NOT apply all changes evenly. That creates patterns. "
-    "Apply changes unevenly. Leave some sentences almost untouched. Modify others more heavily. "
-    "Preserve meaning exactly. Do not add or remove information. "
-    "Do not explain anything. Do not mention editing. Output only the final text."
-)
+# ============================
+# HARD TEXT DETECTION
+# ============================
 
-_MODE = {
-    "standard": (
-        "Keep it mostly similar, but introduce subtle irregularities. "
-        "One or two sentences can shift slightly in structure. "
-        "The rest should feel lightly adjusted, not rewritten."
-    ),
-    "aggressive": (
-        "Break structure more freely. Rearrange sentence flow. "
-        "Let it feel like a different person wrote it, but without making it sound artificial or forced."
-    ),
-    "academic": (
-        "Keep the formal register. But let it breathe unevenly: a hedging clause here, "
-        "a clunky long sentence there, one very short observation that lands abruptly. "
-        "Real academic writing is not uniform. Do not make it uniform."
-    ),
-    "casual": (
-        "Make it loose and unpolished. Contractions, the occasional trailing thought, "
-        "phrasing that sounds more spoken than written. Do not make it too clean."
-    ),
-}
+def _is_hard_text(text: str) -> bool:
+    words = text.split()
+    if len(words) > 120:
+        return True
 
-_VARIATIONS = [
-    "Let the main point of one sentence arrive later than expected, do not lead with it.",
-    "Write one sentence that is four words or fewer and place it where it creates a small pause.",
-    "Let one sentence run noticeably longer than the others, the way a thought sometimes sprawls.",
-    "Start one sentence with But or And, and make it feel like a natural continuation.",
-    "Use a dash instead of a comma or semicolon in one place where it feels slightly informal.",
-    "Leave one idea slightly underdeveloped.",
-    "Add a brief parenthetical that feels like an afterthought.",
-    "Let one sentence begin with a qualifier, time phrase, or condition instead of the subject.",
-    "Use a contraction in a spot where formal writing would usually avoid it.",
-    "Let one sentence feel slightly redundant, not wrong, just a little more than necessary.",
-    "Vary opening word class across consecutive sentences.",
-    "Introduce a mild tonal shift mid-paragraph, then return.",
-]
+    if any(k in text.lower() for k in [
+        "history", "war", "biological", "process",
+        "system", "development", "analysis"
+    ]):
+        return True
 
-_MAX_TOKENS = {
-    "basic": 800,
-    "pro": 1500,
-    "ultra": 5000,
-    "mega": 12000,
-}
-
-_HTML_TAG_RE = re.compile(r"<[^>]{0,200}>")
+    return False
 
 
-class AIUnavailableError(RuntimeError):
-    pass
+# ============================
+# SPLIT CHUNKS
+# ============================
+
+def _split_chunks(text: str, size: int = 3):
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    return [" ".join(sentences[i:i+size]).strip()
+            for i in range(0, len(sentences), size)]
 
 
-def _clean_output(text: str, raw_len: int) -> str:
-    clean = _HTML_TAG_RE.sub("", text).strip()
-    if raw_len > 0 and len(clean) > raw_len * _MAX_OUTPUT_RATIO:
-        logger.warning("AI output exceeded safe ratio")
-        raise AIUnavailableError("ai_output_ratio_exceeded")
-    return clean
+# ============================
+# SENTENCE / PARAGRAPH HELPERS
+# ============================
+
+def _split_sentences(text: str):
+    return [s.strip() for s in re.split(r'(?<=[.!?]) +', text) if s.strip()]
 
 
-def _extract_response_text(response) -> str:
-    chunks = []
-    for part in response.content or []:
-        text = getattr(part, "text", None)
-        if text:
-            chunks.append(text)
-            continue
+def _make_paragraphs(text: str):
+    sents = _split_sentences(text)
+    if len(sents) < 6:
+        return text
 
-        if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
-            chunks.append(part["text"])
+    paras, i = [], 0
+    while i < len(sents):
+        size = random.choice([2, 3])
+        paras.append(" ".join(sents[i:i+size]))
+        i += size
 
-    return "\n".join(chunks).strip()
+    return "\n\n".join(paras)
 
 
-def _fallback(text: str, mode: str) -> str:
-    from utils.post_process import humanize_post_process
+def _light_reorder_paragraphs(text: str):
+    paras = [p for p in text.split("\n\n") if p.strip()]
+    if len(paras) > 2 and random.random() < 0.5:
+        i = random.randint(0, len(paras)-2)
+        paras[i], paras[i+1] = paras[i+1], paras[i]
+    return "\n\n".join(paras)
 
-    base = re.sub(r"\s+", " ", text).strip()
-    if mode == "casual":
-        base = (
-            base.replace("do not", "don't")
-            .replace("cannot", "can't")
-            .replace("will not", "won't")
+
+def _pick_voice():
+    return random.choice([
+        "explain with a small example first",
+        "slightly reflective tone",
+        "contrast style (idea then limitation)",
+        "simple explanatory tone"
+    ])
+
+
+# ============================
+# AI CALL
+# ============================
+
+async def _call_claude(prompt: str):
+    response = await _client.messages.create(
+        model=_MODEL,
+        max_tokens=1200,
+        temperature=0.85,
+        system=(
+            "Rewrite like a human. "
+            "Do not keep original structure. "
+            "Keep meaning same."
+        ),
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
+# ============================
+# MULTI PASS ENGINE
+# ============================
+
+async def _multi_pass_rewrite(text: str):
+
+    is_hard = _is_hard_text(text)
+
+    # PASS 1 — chunk rewrite
+    chunks = _split_chunks(text, 3)
+    rewritten = []
+
+    for ch in chunks:
+        rewritten.append(await _call_claude(
+            f"Rewrite with different structure:\n{ch}"
+        ))
+
+    combined = " ".join(rewritten)
+
+    # PASS 2 — humanization
+    step2 = await _call_claude(
+        f"""
+Rewrite again:
+
+- vary sentence length
+- avoid uniform flow
+- slightly imperfect tone
+
+Text:
+{combined}
+"""
+    )
+
+    # paragraph restructuring
+    step2 = _make_paragraphs(step2)
+    step2 = _light_reorder_paragraphs(step2)
+
+    # 🔥 FINAL PASS ONLY FOR HARD TEXT
+    if is_hard:
+        voice = _pick_voice()
+        step3 = await _call_claude(
+            f"""
+Rewrite this with a {voice}.
+
+- you may slightly change order
+- keep meaning exact
+- avoid smooth AI flow
+
+Text:
+{step2}
+"""
         )
-    return humanize_post_process(base, mode)
+        return step3
+
+    return step2
 
 
-async def _call_claude(prompt: str, plan: str, raw_len: int) -> str:
-    if _client is None:
-        raise AIUnavailableError("client_not_initialized")
-
-    max_tokens = _MAX_TOKENS.get(plan, 800)
-
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            response = await asyncio.wait_for(
-                _client.messages.create(
-                    model=_MODEL,
-                    max_tokens=max_tokens,
-                    system=_SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=_TIMEOUT,
-            )
-
-            output = _extract_response_text(response)
-            if not output:
-                raise AIUnavailableError("empty_response")
-
-            return _clean_output(output, raw_len)
-        except asyncio.TimeoutError as exc:
-            if attempt == MAX_RETRIES:
-                raise AIUnavailableError("timeout") from exc
-        except (APIStatusError, APIConnectionError, APITimeoutError) as exc:
-            if attempt == MAX_RETRIES:
-                raise AIUnavailableError("provider_error") from exc
-        except AIUnavailableError:
-            raise
-        except Exception as exc:
-            if attempt == MAX_RETRIES:
-                logger.error("Anthropic call failed: %s", str(exc))
-                raise AIUnavailableError("unknown_error") from exc
-
-        await asyncio.sleep(0.5 * (attempt + 1))
-
-    raise AIUnavailableError("retry_exhausted")
-
+# ============================
+# MAIN FUNCTION
+# ============================
 
 async def generate_humanized_text(text: str, mode: str, plan: str) -> GenerationResult:
-    raw_len = len(text)
-    mode_instr = _MODE.get(mode, _MODE["standard"])
-    variation_a, variation_b = random.sample(_VARIATIONS, 2)
 
-    prompt = (
-        f"{mode_instr}\n\n"
-        f"Two things to specifically hit: {variation_a} Also: {variation_b}\n\n"
-        f"Here is the text to edit:\n\n{text}"
-    )
+    from utils.post_process import humanize_post_process
 
     if _client:
         try:
-            ai_text = await _call_claude(prompt, plan, raw_len)
-            return GenerationResult(
-                text=ai_text,
-                provider_used="anthropic",
-                model=_MODEL,
-                fallback_used=False,
-            )
-        except AIUnavailableError as exc:
-            reason = str(exc) or "ai_failed"
-            logger.warning("AI failed, reason=%s", reason)
-            if not _ALLOW_LOCAL_FALLBACK:
-                raise
-            fallback_text = _fallback(text, mode)
-            return GenerationResult(
-                text=fallback_text,
-                provider_used="local_fallback",
-                model=_MODEL,
-                fallback_used=True,
-                fallback_reason=reason,
-            )
+            result = await _multi_pass_rewrite(text)
+            result = humanize_post_process(result, mode)
 
-    if not _ALLOW_LOCAL_FALLBACK:
-        raise AIUnavailableError("anthropic_not_configured")
+            return GenerationResult(result, "anthropic", _MODEL, False)
 
-    fallback_text = _fallback(text, mode)
-    return GenerationResult(
-        text=fallback_text,
-        provider_used="local_fallback",
-        model=_MODEL,
-        fallback_used=True,
-        fallback_reason="anthropic_not_configured",
-    )
+        except Exception:
+            fallback = humanize_post_process(text, mode)
+            return GenerationResult(fallback, "fallback", _MODEL, True)
 
+    fallback = humanize_post_process(text, mode)
+    return GenerationResult(fallback, "fallback", _MODEL, True)
