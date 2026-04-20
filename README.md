@@ -1,62 +1,43 @@
 # AI Humanizer API
 
-Convert AI-generated text into more natural writing with plan-based word and request quotas.
+Convert AI-generated text into more natural writing with plan-based monthly quotas.
 
-## API Endpoints
+## Endpoints
 
 ### Core (v1)
 - `POST /v1/humanize`
 - `GET /v1/usage`
 - `GET /v1/plan`
 
-### Legacy aliases (still supported)
+### Legacy aliases
 - `POST /humanize`
 - `GET /usage`
 - `GET /plan`
 
-### Auth
-- `POST /v1/auth/signup`
-- `POST /v1/auth/login`
-- `GET /v1/auth/me`
-- `POST /auth/signup` (legacy)
-- `POST /auth/login` (legacy)
-- `GET /auth/me` (legacy)
-
 ### Health
 - `GET /health`
 
-## Authentication
+## Authentication (RapidAPI Only)
 
-`/humanize` and `/v1/humanize` accept two auth modes:
+Protected endpoints (`/v1/humanize`, `/v1/usage`, and legacy aliases) use RapidAPI headers:
 
-1. RapidAPI headers
 - `x-rapidapi-key` (required)
-- `x-rapidapi-host` (recommended)
-- `x-rapidapi-subscription` (`basic|pro|ultra|mega`)
-- optional `x-rapidapi-user`
-- optional `x-rapidapi-proxy-secret` (required only if `REQUIRE_RAPIDAPI_PROXY_SECRET=true`)
+- `x-rapidapi-proxy-secret` (required when `REQUIRE_RAPIDAPI_PROXY_SECRET=true`)
+- `x-rapidapi-subscription` (`basic|pro|ultra|mega`, optional, defaults to `basic`)
+- `x-rapidapi-user` (optional; if missing, API uses a hashed key-based identifier)
 
-2. Bearer token (JWT)
-- `Authorization: Bearer <token>`
-- token is issued by `/auth/login` or `/auth/signup`
+Proxy secret configuration supports both:
 
-## How plan is resolved
+- `RAPIDAPI_PROXY_SECRET`
+- `RAPIDAPI_SECRET` (fallback alias)
 
-1. If `Authorization: Bearer ...` is present:
-- JWT is validated
-- user is loaded from Redis
-- plan comes from stored user record
-
-2. If no bearer token:
-- RapidAPI middleware validates headers
-- plan comes from `x-rapidapi-subscription`
-- invalid/missing plan defaults to `basic`
-
-## Humanize request example
+## Humanize Request Example
 
 ```http
 POST /v1/humanize
-Authorization: Bearer <token>
+x-rapidapi-key: <api-key>
+x-rapidapi-proxy-secret: <proxy-secret>
+x-rapidapi-subscription: pro
 Content-Type: application/json
 
 {
@@ -65,7 +46,7 @@ Content-Type: application/json
 }
 ```
 
-## Humanize response example
+## Humanize Response Shape
 
 ```json
 {
@@ -77,8 +58,7 @@ Content-Type: application/json
   "generation": {
     "provider_used": "anthropic",
     "model": "claude-sonnet-4-20250514",
-    "fallback_used": false,
-    "fallback_reason": ""
+    "fallback_used": false
   },
   "quota": {
     "words_used": 500,
@@ -91,15 +71,6 @@ Content-Type: application/json
 }
 ```
 
-If `fallback_used` is `true`, provider generation failed and local fallback rewriting was used.
-
-## Usage endpoint response
-
-`GET /v1/usage` (or `/usage`) returns current month usage:
-- words used/limit/remaining
-- requests used/limit/remaining
-- plan limits and available modes
-
 ## Plans
 
 - `basic`: 500 words/month, 500 requests/month, 500 words/request, mode `standard`
@@ -107,33 +78,15 @@ If `fallback_used` is `true`, provider generation failed and local fallback rewr
 - `ultra`: 50,000 words/month, 500,000 requests/month, 5,000 words/request, all modes
 - `mega`: 250,000 words/month, 500,000 requests/month, 15,000 words/request, all modes
 
-## Modes
+## Important Environment Variables
 
-- `standard`
-- `aggressive`
-- `academic`
-- `casual`
-
-## Important environment variables
-
-- `RAPIDAPI_PROXY_SECRET` (or `RAPIDAPI_SECRET`)
-- `REQUIRE_RAPIDAPI_PROXY_SECRET`
+- `RAPIDAPI_PROXY_SECRET` or `RAPIDAPI_SECRET`
+- `REQUIRE_RAPIDAPI_PROXY_SECRET` (`true` by default)
 - `ANTHROPIC_API_KEY`
-- `ANTHROPIC_MODEL` (default `claude-sonnet-4-20250514`)
-- `ALLOW_LOCAL_FALLBACK` (`true` or `false`)
-- `JWT_SECRET` (minimum 32 chars)
-- `JWT_ALGORITHM`
-- `JWT_EXPIRES_IN_HOURS`
+- `ANTHROPIC_MODEL`
 - `UPSTASH_REDIS_URL`
 - `UPSTASH_REDIS_REST_URL`
 - `UPSTASH_REDIS_REST_TOKEN`
-
-## Errors
-
-- `400` invalid input
-- `401` unauthorized
-- `403` mode not allowed for plan
-- `408` timeout
-- `429` rate limit or monthly quota exceeded
-- `502` AI unavailable/error
-- `503` backend unavailable
+- `MAX_BODY_SIZE`
+- `REQUEST_TIMEOUT`
+- `ALLOWED_ORIGINS`

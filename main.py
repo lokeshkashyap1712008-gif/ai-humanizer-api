@@ -4,7 +4,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,15 +14,13 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from middleware.auth import verify_rapidapi
-from middleware.jwt_auth import require_authenticated_user
+
 from middleware.rate_limit import limiter, get_rate_limit
 from utils.sanitize import sanitize_text, InjectionDetected
 from utils.post_process import humanize_post_process
 from utils.tokens import count_words, get_month_key, get_month_expiry
 from utils.ai_router import generate_humanized_text
 from utils.redis_client import get_redis
-from routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router
-from utils.jwt_utils import get_jwt_secret
 from config import (
     DEFAULT_PLAN,
     PLAN_CONFIG,
@@ -48,8 +46,7 @@ logger = logging.getLogger(__name__)
 
 # ── App Init ──────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None)
-app.include_router(auth_router)
-app.include_router(auth_legacy_router)
+
 
 AUTH_DEBUG_VERSION = "rapidapi-auth-debug-v2"
 logger.info("Starting app with %s", AUTH_DEBUG_VERSION)
@@ -65,21 +62,6 @@ app.add_middleware(
 )
 
 secure_headers = Secure()
-
-
-def _validate_startup_configuration() -> None:
-    """
-    Fail fast on configuration that would break authenticated usage in production.
-    """
-    try:
-        get_jwt_secret()
-    except RuntimeError as exc:
-        if os.getenv("STRICT_EXTERNALS", "false").strip().lower() in {"1", "true", "yes", "on"}:
-            raise
-        logger.warning("JWT configuration is not production-ready: %s", exc)
-
-
-_validate_startup_configuration()
 
 # ── Auth Middleware ───────────────────────────────────────
 app.middleware("http")(verify_rapidapi)
@@ -280,21 +262,21 @@ async def health():
 # All core endpoints are prefixed with /v1 for version management
 
 @app.post("/v1/humanize")
-@app.post("/humanize")  # Legacy support (deprecated, will be removed in v2)
+@app.post("/humanize")
 @limiter.limit(get_rate_limit)
 async def humanize(
     request: Request,
     body: HumanizeRequest,
-    _auth_user: str = Depends(require_authenticated_user),
 ):
-
-    request_id = getattr(request.state, "request_id", "unknown")
+    if not hasattr(request.state, "user_id"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not hasattr(request.state, "plan") or request.state.plan not in VALID_PLANS:
         raise HTTPException(status_code=401, detail="Invalid subscription plan")
 
     user_id = request.state.user_id
     plan = request.state.plan
+    request_id = getattr(request.state, "request_id", "unknown")
 
     # Mode access
     if body.mode not in PLAN_MODE_ACCESS[plan]:
@@ -379,8 +361,6 @@ async def humanize(
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=408, detail="AI timeout")
-    except AIUnavailableError as exc:
-        raise HTTPException(status_code=502, detail=f"AI unavailable: {str(exc)}")
     except Exception:
         raise HTTPException(status_code=502, detail="AI error")
 
@@ -404,7 +384,6 @@ async def humanize(
             "provider_used": generation.provider_used,
             "model": generation.model,
             "fallback_used": generation.fallback_used,
-            "fallback_reason": generation.fallback_reason,
         },
         "quota": {
             "words_used": words_result,
@@ -432,9 +411,11 @@ async def humanize(
 @limiter.limit(get_rate_limit)
 async def get_usage(
     request: Request,
-    _auth_user: str = Depends(require_authenticated_user),
 ):
-    """Get current usage statistics for the authenticated user."""
+    """Get current usage statistics for the authenticated RapidAPI user."""
+    if not hasattr(request.state, "user_id"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     if not hasattr(request.state, "plan") or request.state.plan not in VALID_PLANS:
         raise HTTPException(status_code=401, detail="Invalid subscription plan")
 

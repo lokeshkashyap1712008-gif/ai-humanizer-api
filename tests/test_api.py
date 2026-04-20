@@ -1,8 +1,13 @@
+import os
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+os.environ.setdefault("RAPIDAPI_PROXY_SECRET", "test-proxy-secret")
+os.environ.setdefault("REQUIRE_RAPIDAPI_PROXY_SECRET", "true")
+
 import main
+from middleware import auth as auth_middleware
 from utils.ai_router import GenerationResult
 from utils.redis_client import _InMemoryRedis
 
@@ -15,20 +20,20 @@ def setup_function():
     main.app.state._state["limiter"] = main.limiter
     main.app.dependency_overrides = {}
     main.get_redis.__globals__["_redis"] = _InMemoryRedis()
+    auth_middleware._EXPECTED_PROXY_SECRET = "test-proxy-secret"
+    auth_middleware._REQUIRE_PROXY_SECRET = True
 
 
-def _signup_and_token(plan: str = "pro") -> str:
-    email = f"test-{uuid4().hex}@example.com"
-    response = client.post(
-        "/v1/auth/signup",
-        json={
-            "email": email,
-            "password": "SuperSecurePassword123!",
-            "plan": plan,
-        },
-    )
-    assert response.status_code == 200, response.text
-    return response.json()["token"]
+def _rapidapi_headers(plan: str = "pro", user_id: str | None = None) -> dict[str, str]:
+    if user_id is None:
+        user_id = f"user-{uuid4().hex[:10]}"
+
+    return {
+        "x-rapidapi-key": "test-api-key",
+        "x-rapidapi-proxy-secret": "test-proxy-secret",
+        "x-rapidapi-subscription": plan,
+        "x-rapidapi-user": user_id,
+    }
 
 
 def test_plan_endpoint_is_public():
@@ -40,19 +45,20 @@ def test_plan_endpoint_is_public():
     assert body["plans"]["basic"]["per_request_words"] == 500
 
 
-def test_auth_round_trip_and_me_endpoint():
-    token = _signup_and_token(plan="ultra")
+def test_humanize_requires_proxy_secret_header():
+    headers = _rapidapi_headers()
+    headers.pop("x-rapidapi-proxy-secret")
 
-    me_response = client.get(
-        "/v1/auth/me",
-        headers={"Authorization": f"Bearer {token}"},
+    response = client.post(
+        "/v1/humanize",
+        headers=headers,
+        json={
+            "text": "This should fail without proxy secret.",
+            "mode": "standard",
+        },
     )
 
-    assert me_response.status_code == 200, me_response.text
-    payload = me_response.json()
-    assert payload["success"] is True
-    assert payload["user"]["plan"] == "ultra"
-    assert "academic" in payload["rights"]["modes"]
+    assert response.status_code == 401
 
 
 def test_humanize_endpoint_returns_generation_and_quota(monkeypatch):
@@ -66,10 +72,9 @@ def test_humanize_endpoint_returns_generation_and_quota(monkeypatch):
 
     monkeypatch.setattr(main, "generate_humanized_text", fake_generate)
 
-    token = _signup_and_token(plan="pro")
     response = client.post(
         "/v1/humanize",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=_rapidapi_headers(plan="pro", user_id="user-pro-1"),
         json={
             "text": "This is a source paragraph that should stay stable.",
             "mode": "academic",
@@ -82,3 +87,31 @@ def test_humanize_endpoint_returns_generation_and_quota(monkeypatch):
     assert payload["generation"]["provider_used"] == "anthropic"
     assert payload["quota"]["words_used"] >= payload["original_word_count"]
     assert "X-Ratelimit-Limit" in response.headers
+
+
+def test_usage_endpoint_returns_current_quota(monkeypatch):
+    async def fake_generate(text: str, mode: str, plan: str) -> GenerationResult:
+        return GenerationResult(
+            text=f"{text} rewritten",
+            provider_used="fallback",
+            model="test-model",
+            fallback_used=True,
+        )
+
+    monkeypatch.setattr(main, "generate_humanized_text", fake_generate)
+
+    headers = _rapidapi_headers(plan="basic", user_id="usage-user-1")
+    seed_response = client.post(
+        "/v1/humanize",
+        headers=headers,
+        json={"text": "Quick sample input for usage meter.", "mode": "standard"},
+    )
+    assert seed_response.status_code == 200, seed_response.text
+
+    usage_response = client.get("/v1/usage", headers=headers)
+    assert usage_response.status_code == 200, usage_response.text
+
+    payload = usage_response.json()
+    assert payload["plan"] == "basic"
+    assert payload["quotas"]["words"]["used"] > 0
+    assert payload["quotas"]["requests"]["used"] > 0

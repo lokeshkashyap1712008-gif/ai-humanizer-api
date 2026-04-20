@@ -1,136 +1,70 @@
-# ============================================================
-# middleware/auth.py — RapidAPI Authentication Middleware
-# ============================================================
-
 import hashlib
-import hmac
 import logging
 import os
 import re
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
 
 from config import DEFAULT_PLAN, VALID_PLANS
 
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-RAPIDAPI_SECRET = (
-    os.getenv("RAPIDAPI_PROXY_SECRET")
-    or os.getenv("RAPIDAPI_SECRET")
-)
+_SAFE_ID_RE = re.compile(r"^[\x21-\x7E]{1,128}$")
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
-REQUIRE_RAPIDAPI_PROXY_SECRET = os.getenv(
-    "REQUIRE_RAPIDAPI_PROXY_SECRET", "false"
-).lower() == "true"
-
-_SECRET_BYTES = RAPIDAPI_SECRET.encode("utf-8") if RAPIDAPI_SECRET else b""
-
-_SAFE_ID_RE = re.compile(r'^[\x21-\x7E]{1,128}$')
-
-_MAX_SECRET_LEN = 512
+# Public routes
 _PUBLIC_PATHS = {"/", "/health", "/plan", "/v1/plan"}
-_PUBLIC_PREFIXES = ("/auth/", "/v1/auth/")
+_PUBLIC_PREFIXES = ()
+
+_EXPECTED_PROXY_SECRET = (
+    os.getenv("RAPIDAPI_PROXY_SECRET", "").strip()
+    or os.getenv("RAPIDAPI_SECRET", "").strip()
+)
+_REQUIRE_PROXY_SECRET = (
+    os.getenv("REQUIRE_RAPIDAPI_PROXY_SECRET", "true").strip().lower() in _TRUE_VALUES
+)
 
 
 def _is_public_path(path: str) -> bool:
-    return path in _PUBLIC_PATHS or any(
-        path.startswith(prefix) for prefix in _PUBLIC_PREFIXES
-    )
+    return path in _PUBLIC_PATHS or any(path.startswith(prefix) for prefix in _PUBLIC_PREFIXES)
+
+
+def _unauthorized() -> JSONResponse:
+    return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
 
 async def verify_rapidapi(request: Request, call_next):
-
     if request.method == "OPTIONS" or _is_public_path(request.url.path):
         return await call_next(request)
 
-    auth_header = request.headers.get("authorization", "").strip().lower()
-    if auth_header.startswith("bearer "):
-        return await call_next(request)
+    api_key = request.headers.get("x-rapidapi-key")
+    if not api_key:
+        return _unauthorized()
 
-    # ============================
-    # 🔥 FIX 1: Robust API key read
-    # ============================
-    raw_api_key = (
-        request.headers.get("x-rapidapi-key")
-        or request.headers.get("X-RapidAPI-Key")
-        or ""
-    )
-
-    raw_secret   = request.headers.get("x-rapidapi-proxy-secret", "")
-    raw_host     = request.headers.get("x-rapidapi-host", "")
-    raw_user_id  = request.headers.get("x-rapidapi-user", "")
-
-    # ============================
-    # 🔥 FIX 2: Plan header safe fallback
-    # ============================
-    raw_plan = (
-        request.headers.get("x-rapidapi-plan")
-        or request.headers.get("x-rapidapi-subscription")
-        or DEFAULT_PLAN
-    ).lower()
-
-    logger.info(
-        "rapidapi_auth request path=%s has_key=%s has_host=%s has_user=%s plan=%s",
-        request.url.path,
-        bool(raw_api_key),
-        bool(raw_host),
-        bool(raw_user_id),
-        raw_plan,
-    )
-
-    # ============================
-    # 🔥 REQUIRED CHECK
-    # ============================
-    if not raw_api_key:
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
-
-    # ============================
-    # 🔥 FIX 3: Disable proxy secret validation
-    # ============================
-    should_validate_secret = False
-
-    if should_validate_secret:
-        if REQUIRE_RAPIDAPI_PROXY_SECRET and not raw_secret:
-            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
-
-        if len(raw_secret) > _MAX_SECRET_LEN:
-            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
-
-        try:
-            authorized = hmac.compare_digest(
-                raw_secret.encode("utf-8"),
-                _SECRET_BYTES,
+    if _REQUIRE_PROXY_SECRET:
+        if not _EXPECTED_PROXY_SECRET:
+            logger.error(
+                "Proxy secret is required but not configured. "
+                "Set RAPIDAPI_PROXY_SECRET or RAPIDAPI_SECRET."
             )
-        except Exception:
-            authorized = False
+            return JSONResponse(status_code=503, content={"error": "Service unavailable"})
 
-        if not authorized:
-            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+        proxy_secret = request.headers.get("x-rapidapi-proxy-secret", "")
+        if proxy_secret != _EXPECTED_PROXY_SECRET:
+            return _unauthorized()
 
-    # ============================
-    # PLAN VALIDATION
-    # ============================
+    raw_plan = (request.headers.get("x-rapidapi-subscription") or DEFAULT_PLAN).lower()
     plan = raw_plan if raw_plan in VALID_PLANS else DEFAULT_PLAN
 
-    # ============================
-    # USER ID SAFE GENERATION
-    # ============================
+    raw_user_id = request.headers.get("x-rapidapi-user", "")
     if _SAFE_ID_RE.match(raw_user_id):
         user_id = raw_user_id
     else:
-        user_id = f"key-{hashlib.sha256(raw_api_key.encode()).hexdigest()[:16]}"
+        user_id = f"key-{hashlib.sha256(api_key.encode()).hexdigest()[:16]}"
 
     request.state.user_id = user_id
     request.state.plan = plan
 
-    logger.info(
-        "rapidapi_auth accepted user_id=%s plan=%s",
-        user_id,
-        plan,
-    )
-
+    logger.info("RapidAPI auth OK user=%s plan=%s", user_id, plan)
     return await call_next(request)
