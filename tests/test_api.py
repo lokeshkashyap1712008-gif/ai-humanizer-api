@@ -24,16 +24,22 @@ def setup_function():
     auth_middleware._REQUIRE_PROXY_SECRET = True
 
 
-def _rapidapi_headers(plan: str = "pro", user_id: str | None = None) -> dict[str, str]:
+def _rapidapi_headers(
+    plan: str = "pro",
+    user_id: str | None = None,
+    include_api_key: bool = True,
+) -> dict[str, str]:
     if user_id is None:
         user_id = f"user-{uuid4().hex[:10]}"
 
-    return {
-        "x-rapidapi-key": "test-api-key",
+    headers = {
         "x-rapidapi-proxy-secret": "test-proxy-secret",
         "x-rapidapi-subscription": plan,
         "x-rapidapi-user": user_id,
     }
+    if include_api_key:
+        headers["x-rapidapi-key"] = "test-api-key"
+    return headers
 
 
 def test_plan_endpoint_is_public():
@@ -87,6 +93,36 @@ def test_humanize_endpoint_returns_generation_and_quota(monkeypatch):
     assert payload["generation"]["provider_used"] == "anthropic"
     assert payload["quota"]["words_used"] >= payload["original_word_count"]
     assert "X-Ratelimit-Limit" in response.headers
+
+
+def test_humanize_allows_proxy_secret_without_api_key(monkeypatch):
+    async def fake_generate(text: str, mode: str, plan: str) -> GenerationResult:
+        return GenerationResult(
+            text=f"{text} Humanized.",
+            provider_used="anthropic",
+            model="test-model",
+            fallback_used=False,
+        )
+
+    monkeypatch.setattr(main, "generate_humanized_text", fake_generate)
+
+    response = client.post(
+        "/v1/humanize",
+        headers=_rapidapi_headers(
+            plan="basic",
+            user_id="user-basic-no-key",
+            include_api_key=False,
+        ),
+        json={
+            "text": "Basic plan text sample.",
+            "mode": "standard",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["mode"] == "standard"
 
 
 def test_usage_endpoint_returns_current_quota(monkeypatch):

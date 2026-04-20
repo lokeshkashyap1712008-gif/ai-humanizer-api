@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -38,8 +39,16 @@ async def verify_rapidapi(request: Request, call_next):
     if request.method == "OPTIONS" or _is_public_path(request.url.path):
         return await call_next(request)
 
-    api_key = request.headers.get("x-rapidapi-key")
-    if not api_key:
+    api_key = (request.headers.get("x-rapidapi-key") or "").strip()
+    proxy_secret = (request.headers.get("x-rapidapi-proxy-secret") or "").strip()
+    raw_user_id = (request.headers.get("x-rapidapi-user") or "").strip()
+
+    # RapidAPI provider traffic may not always forward x-rapidapi-key.
+    if not any([api_key, proxy_secret, raw_user_id]):
+        logger.warning(
+            "RapidAPI auth failed path=%s reason=no_identity_headers",
+            request.url.path,
+        )
         return _unauthorized()
 
     if _REQUIRE_PROXY_SECRET:
@@ -50,18 +59,33 @@ async def verify_rapidapi(request: Request, call_next):
             )
             return JSONResponse(status_code=503, content={"error": "Service unavailable"})
 
-        proxy_secret = request.headers.get("x-rapidapi-proxy-secret", "")
-        if proxy_secret != _EXPECTED_PROXY_SECRET:
+        if not hmac.compare_digest(proxy_secret, _EXPECTED_PROXY_SECRET):
+            logger.warning(
+                "RapidAPI auth failed path=%s reason=proxy_secret_mismatch",
+                request.url.path,
+            )
+            return _unauthorized()
+    elif _EXPECTED_PROXY_SECRET and proxy_secret:
+        # If a secret is configured and a header is supplied, it must match.
+        if not hmac.compare_digest(proxy_secret, _EXPECTED_PROXY_SECRET):
+            logger.warning(
+                "RapidAPI auth failed path=%s reason=proxy_secret_mismatch_optional",
+                request.url.path,
+            )
             return _unauthorized()
 
-    raw_plan = (request.headers.get("x-rapidapi-subscription") or DEFAULT_PLAN).lower()
+    raw_plan = (
+        request.headers.get("x-rapidapi-subscription")
+        or request.headers.get("x-rapidapi-plan")
+        or DEFAULT_PLAN
+    ).lower()
     plan = raw_plan if raw_plan in VALID_PLANS else DEFAULT_PLAN
 
-    raw_user_id = request.headers.get("x-rapidapi-user", "")
     if _SAFE_ID_RE.match(raw_user_id):
         user_id = raw_user_id
     else:
-        user_id = f"key-{hashlib.sha256(api_key.encode()).hexdigest()[:16]}"
+        identity_seed = api_key or raw_user_id or (request.client.host if request.client else "unknown")
+        user_id = f"key-{hashlib.sha256(identity_seed.encode()).hexdigest()[:16]}"
 
     request.state.user_id = user_id
     request.state.plan = plan
