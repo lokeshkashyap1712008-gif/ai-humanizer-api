@@ -34,7 +34,7 @@ from config import (
 
 # ── Config ────────────────────────────────────────────────
 MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", 50 * 1024))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 60))
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # ── Logging ───────────────────────────────────────────────
