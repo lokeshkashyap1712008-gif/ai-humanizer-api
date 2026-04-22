@@ -1,4 +1,5 @@
 import os
+import asyncio
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -151,3 +152,53 @@ def test_usage_endpoint_returns_current_quota(monkeypatch):
     assert payload["plan"] == "basic"
     assert payload["quotas"]["words"]["used"] > 0
     assert payload["quotas"]["requests"]["used"] > 0
+
+
+def test_humanize_chunks_large_input(monkeypatch):
+    call_count = 0
+
+    async def fake_generate(text: str, mode: str, plan: str) -> GenerationResult:
+        nonlocal call_count
+        call_count += 1
+        return GenerationResult(
+            text=f"{text} rewritten",
+            provider_used="anthropic",
+            model="test-model",
+            fallback_used=False,
+        )
+
+    monkeypatch.setattr(main, "generate_humanized_text", fake_generate)
+
+    large_text = " ".join([f"word{i}" for i in range(700)])
+    response = client.post(
+        "/v1/humanize",
+        headers=_rapidapi_headers(plan="pro", user_id="chunk-user-1"),
+        json={"text": large_text, "mode": "standard"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["processing"]["chunked"] is True
+    assert payload["processing"]["total_chunks"] > 1
+    assert payload["processing"]["total_chunks"] == call_count
+    assert payload["generation"]["provider_used"] == "anthropic"
+
+
+def test_humanize_handles_chunk_timeout_without_408(monkeypatch):
+    async def fake_generate(_text: str, _mode: str, _plan: str) -> GenerationResult:
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(main, "generate_humanized_text", fake_generate)
+
+    medium_text = " ".join([f"w{i}" for i in range(400)])
+    response = client.post(
+        "/v1/humanize",
+        headers=_rapidapi_headers(plan="pro", user_id="timeout-user-1"),
+        json={"text": medium_text, "mode": "standard"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["generation"]["fallback_used"] is True
+    assert payload["processing"]["timeout_chunks"] >= 1
+    assert payload["humanized_text"].strip() != ""

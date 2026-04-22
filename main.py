@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -36,6 +37,33 @@ from config import (
 MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", 50 * 1024))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 60))
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+_HUMANIZE_PATHS = {"/v1/humanize", "/humanize"}
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+_PLAN_CHUNK_WORD_TARGETS = {
+    "basic": 200,
+    "pro": 230,
+    "ultra": 260,
+    "mega": 280,
+}
+
+_PLAN_CHUNK_BATCH_SIZE = {
+    "basic": 1,
+    "pro": 1,
+    "ultra": 2,
+    "mega": 3,
+}
+
+_PLAN_CHUNKING_TRIGGER_WORDS = {
+    "basic": 220,
+    "pro": 260,
+    "ultra": 300,
+    "mega": 300,
+}
+
+_MAX_CHUNK_WORDS = 300
+_MAX_TIMEOUT_CHUNKS_BEFORE_FAST_FALLBACK = 2
 
 # ── Logging ───────────────────────────────────────────────
 logging.basicConfig(
@@ -91,6 +119,10 @@ async def security_headers_middleware(request: Request, call_next):
 # ── Timeout Middleware ────────────────────────────────────
 @app.middleware("http")
 async def timeout_middleware(request: Request, call_next):
+    normalized_path = request.url.path.rstrip("/") or "/"
+    if normalized_path in _HUMANIZE_PATHS:
+        return await call_next(request)
+
     try:
         return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT)
     except asyncio.TimeoutError:
@@ -238,6 +270,232 @@ class HumanizeRequest(BaseModel):
     )
 
 
+def _split_text_into_chunks(
+    text: str,
+    target_words: int,
+    max_words: int = _MAX_CHUNK_WORDS,
+) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    if not sentences:
+        return [text]
+
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_words = 0
+
+    def flush_current() -> None:
+        nonlocal current_parts, current_words
+        if current_parts:
+            chunks.append(" ".join(current_parts).strip())
+            current_parts = []
+            current_words = 0
+
+    for sentence in sentences:
+        sentence_words = sentence.split()
+        sentence_len = len(sentence_words)
+
+        if sentence_len > max_words:
+            flush_current()
+            for i in range(0, sentence_len, target_words):
+                part = " ".join(sentence_words[i : i + target_words]).strip()
+                if part:
+                    chunks.append(part)
+            continue
+
+        if current_parts and current_words + sentence_len > max_words:
+            flush_current()
+
+        current_parts.append(sentence)
+        current_words += sentence_len
+
+        if current_words >= target_words:
+            flush_current()
+
+    flush_current()
+    return chunks
+
+
+def _chunk_timeout_seconds(plan: str, total_words: int, chunk_words: int) -> int:
+    if total_words <= 250:
+        base_timeout = 22
+    elif total_words <= 600:
+        base_timeout = 30
+    elif total_words <= 1200:
+        base_timeout = 45
+    else:
+        base_timeout = 55
+
+    plan_adjustment = {
+        "basic": 0,
+        "pro": 2,
+        "ultra": 3,
+        "mega": 5,
+    }.get(plan, 0)
+
+    chunk_adjustment = 0
+    if chunk_words >= 250:
+        chunk_adjustment = 3
+    if chunk_words >= 290:
+        chunk_adjustment = 5
+
+    timeout_seconds = base_timeout + plan_adjustment + chunk_adjustment
+    return max(20, min(60, int(timeout_seconds)))
+
+
+def _build_fallback_chunk_result(chunk_text: str, mode: str, reason: str) -> dict:
+    return {
+        "text": humanize_post_process(chunk_text, mode),
+        "provider_used": "fallback",
+        "model": f"{reason}-fallback",
+        "fallback_used": True,
+        "timed_out": reason == "timeout",
+        "failed": reason in {"timeout", "error"},
+        "skipped_ai": reason == "skipped",
+    }
+
+
+async def _generate_chunk_with_resilience(
+    chunk_text: str,
+    mode: str,
+    plan: str,
+    total_words: int,
+    request_id: str,
+    chunk_index: int,
+) -> dict:
+    chunk_word_count = count_words(chunk_text)
+    timeout_seconds = _chunk_timeout_seconds(plan, total_words, chunk_word_count)
+
+    try:
+        generation = await asyncio.wait_for(
+            generate_humanized_text(chunk_text, mode, plan),
+            timeout=timeout_seconds,
+        )
+        processed_text = (
+            generation.text
+            if generation.fallback_used
+            else humanize_post_process(generation.text, mode)
+        )
+        return {
+            "text": processed_text,
+            "provider_used": generation.provider_used,
+            "model": generation.model,
+            "fallback_used": generation.fallback_used,
+            "timed_out": False,
+            "failed": False,
+            "skipped_ai": False,
+        }
+    except asyncio.TimeoutError:
+        logger.warning(
+            "AI chunk timeout request_id=%s plan=%s chunk=%s timeout=%ss",
+            request_id,
+            plan,
+            chunk_index,
+            timeout_seconds,
+        )
+        return _build_fallback_chunk_result(chunk_text, mode, "timeout")
+    except Exception:
+        logger.exception(
+            "AI chunk error request_id=%s plan=%s chunk=%s",
+            request_id,
+            plan,
+            chunk_index,
+        )
+        return _build_fallback_chunk_result(chunk_text, mode, "error")
+
+
+async def _humanize_text_in_chunks(
+    clean_text: str,
+    mode: str,
+    plan: str,
+    request_id: str,
+) -> dict:
+    total_words = count_words(clean_text)
+    target_words = _PLAN_CHUNK_WORD_TARGETS[plan]
+    batch_size = _PLAN_CHUNK_BATCH_SIZE[plan]
+    chunking_trigger = _PLAN_CHUNKING_TRIGGER_WORDS[plan]
+
+    if total_words <= chunking_trigger:
+        chunks = [clean_text]
+    else:
+        chunks = _split_text_into_chunks(
+            clean_text,
+            target_words=target_words,
+            max_words=_MAX_CHUNK_WORDS,
+        )
+        if not chunks:
+            chunks = [clean_text]
+
+    results: list[dict] = []
+    timeout_chunks = 0
+    failed_chunks = 0
+    ai_skipped_chunks = 0
+
+    for start in range(0, len(chunks), batch_size):
+        if timeout_chunks >= _MAX_TIMEOUT_CHUNKS_BEFORE_FAST_FALLBACK:
+            for chunk in chunks[start:]:
+                ai_skipped_chunks += 1
+                results.append(_build_fallback_chunk_result(chunk, mode, "skipped"))
+            break
+
+        batch = chunks[start : start + batch_size]
+        batch_results = await asyncio.gather(
+            *[
+                _generate_chunk_with_resilience(
+                    chunk_text=chunk,
+                    mode=mode,
+                    plan=plan,
+                    total_words=total_words,
+                    request_id=request_id,
+                    chunk_index=start + idx,
+                )
+                for idx, chunk in enumerate(batch)
+            ]
+        )
+
+        results.extend(batch_results)
+        timeout_chunks += sum(1 for item in batch_results if item["timed_out"])
+        failed_chunks += sum(1 for item in batch_results if item["failed"])
+
+    output_chunks = [item["text"] for item in results if item["text"].strip()]
+    if not output_chunks:
+        output_chunks = [humanize_post_process(clean_text, mode)]
+        results = [_build_fallback_chunk_result(clean_text, mode, "error")]
+        timeout_chunks = 0
+        failed_chunks = 1
+
+    provider_values = {item["provider_used"] for item in results if item["provider_used"]}
+    model_values = {item["model"] for item in results if item["model"]}
+
+    provider_used = next(iter(provider_values)) if len(provider_values) == 1 else "mixed"
+    model_used = next(iter(model_values)) if len(model_values) == 1 else "mixed"
+
+    if not provider_values:
+        provider_used = "fallback"
+    if not model_values:
+        model_used = "fallback"
+
+    fallback_used = any(item["fallback_used"] for item in results)
+    if ai_skipped_chunks:
+        fallback_used = True
+
+    return {
+        "text": "\n\n".join(output_chunks).strip(),
+        "provider_used": provider_used,
+        "model": model_used,
+        "fallback_used": fallback_used,
+        "chunked": len(chunks) > 1,
+        "total_chunks": len(chunks),
+        "processed_chunks": len(output_chunks),
+        "timeout_chunks": timeout_chunks,
+        "failed_chunks": failed_chunks,
+        "ai_skipped_chunks": ai_skipped_chunks,
+    }
+
+
 # ── Root Route ────────────────────────────────────────────
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
@@ -353,21 +611,13 @@ async def humanize(
     if requests_result == -2:
         raise HTTPException(status_code=503, detail="Quota system error")
 
-    # AI call
-    try:
-        generation = await asyncio.wait_for(
-            generate_humanized_text(clean_text, body.mode, plan),
-            timeout=30,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="AI timeout")
-    except Exception:
-        raise HTTPException(status_code=502, detail="AI error")
-
-    if generation.fallback_used:
-        post_processed = generation.text
-    else:
-        post_processed = humanize_post_process(generation.text, body.mode)
+    generation = await _humanize_text_in_chunks(
+        clean_text=clean_text,
+        mode=body.mode,
+        plan=plan,
+        request_id=request_id,
+    )
+    post_processed = generation["text"]
     monthly_word_limit = PLAN_LIMITS[plan]["monthly_words"]
     monthly_request_limit = PLAN_LIMITS[plan]["monthly_requests"]
     words_remaining = max(monthly_word_limit - words_result, 0)
@@ -381,9 +631,17 @@ async def humanize(
         "output_word_count": count_words(post_processed),
         "mode": body.mode,
         "generation": {
-            "provider_used": generation.provider_used,
-            "model": generation.model,
-            "fallback_used": generation.fallback_used,
+            "provider_used": generation["provider_used"],
+            "model": generation["model"],
+            "fallback_used": generation["fallback_used"],
+        },
+        "processing": {
+            "chunked": generation["chunked"],
+            "total_chunks": generation["total_chunks"],
+            "processed_chunks": generation["processed_chunks"],
+            "timeout_chunks": generation["timeout_chunks"],
+            "failed_chunks": generation["failed_chunks"],
+            "ai_skipped_chunks": generation["ai_skipped_chunks"],
         },
         "quota": {
             "words_used": words_result,
