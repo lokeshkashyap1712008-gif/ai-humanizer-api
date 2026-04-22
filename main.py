@@ -357,7 +357,7 @@ async def humanize(
     try:
         generation = await asyncio.wait_for(
             generate_humanized_text(clean_text, body.mode, plan),
-            timeout=15,
+            timeout=30,
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=408, detail="AI timeout")
