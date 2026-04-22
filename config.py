@@ -36,7 +36,7 @@ PLAN_CONFIG: Dict[str, dict] = {
         "monthly_words": 500,
         "monthly_requests": 500,
         "per_request_words": 500,
-        "modes": {"standard"},
+        "modes": {"standard", "aggressive", "academic", "casual"},
         "priority": False,
         "bulk": False,
     },
