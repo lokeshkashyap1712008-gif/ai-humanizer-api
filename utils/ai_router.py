@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import os
-import random
 import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from anthropic import AsyncAnthropic
+from utils.quality_gate import score_candidate
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -26,21 +26,16 @@ class GenerationResult:
 
 
 # ============================
-# HARD TEXT DETECTION
+# HELPERS
 # ============================
 
-def _is_hard_text(text: str) -> bool:
-    words = text.split()
-    if len(words) > 120:
-        return True
-
-    if any(k in text.lower() for k in [
-        "history", "war", "biological", "process",
-        "system", "development", "analysis"
-    ]):
-        return True
-
-    return False
+def _get_candidate_count(plan: str) -> int:
+    return {
+        "basic": 1,
+        "pro": 2,
+        "ultra": 3,
+        "mega": 3,
+    }.get(plan, 2)
 
 
 # ============================
@@ -52,46 +47,6 @@ def _split_chunks(text: str, size: int = 3):
     return [" ".join(sentences[i:i+size]).strip()
             for i in range(0, len(sentences), size)]
 
-
-# ============================
-# SENTENCE / PARAGRAPH HELPERS
-# ============================
-
-def _split_sentences(text: str):
-    return [s.strip() for s in re.split(r'(?<=[.!?]) +', text) if s.strip()]
-
-
-def _make_paragraphs(text: str):
-    sents = _split_sentences(text)
-    if len(sents) < 6:
-        return text
-
-    paras, i = [], 0
-    while i < len(sents):
-        size = random.choice([2, 3])
-        paras.append(" ".join(sents[i:i+size]))
-        i += size
-
-    return "\n\n".join(paras)
-
-
-def _light_reorder_paragraphs(text: str):
-    paras = [p for p in text.split("\n\n") if p.strip()]
-    if len(paras) > 2 and random.random() < 0.5:
-        i = random.randint(0, len(paras)-2)
-        paras[i], paras[i+1] = paras[i+1], paras[i]
-    return "\n\n".join(paras)
-
-
-def _pick_voice():
-    return random.choice([
-        "explain with a small example first",
-        "slightly reflective tone",
-        "contrast style (idea then limitation)",
-        "simple explanatory tone"
-    ])
-
-
 # ============================
 # AI CALL
 # ============================
@@ -102,9 +57,8 @@ async def _call_claude(prompt: str):
         max_tokens=1200,
         temperature=0.85,
         system=(
-            "Rewrite like a human. "
-            "Do not keep original structure. "
-            "Keep meaning same."
+            "Rewrite naturally with strong clarity while preserving meaning. "
+            "Do not invent facts, remove key details, or add fluff."
         ),
         messages=[{"role": "user", "content": prompt}],
     )
@@ -112,60 +66,98 @@ async def _call_claude(prompt: str):
 
 
 # ============================
-# MULTI PASS ENGINE
+# MULTI CANDIDATE ENGINE
 # ============================
 
-async def _multi_pass_rewrite(text: str):
-
-    is_hard = _is_hard_text(text)
-
-    # PASS 1 — chunk rewrite
+async def _single_candidate_rewrite(text: str, mode: str, style_hint: str) -> str:
     chunks = _split_chunks(text, 3)
     rewritten = []
 
     for ch in chunks:
-        rewritten.append(await _call_claude(
-            f"Rewrite with different structure:\n{ch}"
-        ))
+        rewritten.append(
+            await _call_claude(
+                f"""
+Rewrite this chunk with a different sentence structure.
+Mode: {mode}
+Style hint: {style_hint}
+
+Rules:
+- keep all original meaning
+- keep topic and intent unchanged
+- improve fluency and readability
+- keep output concise and coherent
+
+Chunk:
+{ch}
+"""
+            )
+        )
 
     combined = " ".join(rewritten)
 
-    # PASS 2 — humanization
-    step2 = await _call_claude(
+    return await _call_claude(
         f"""
-Rewrite again:
+Do a final editorial pass on this rewritten text.
+Mode: {mode}
+Style hint: {style_hint}
 
-- vary sentence length
-- avoid uniform flow
-- slightly imperfect tone
+Rules:
+- preserve meaning exactly
+- improve transitions and flow
+- vary sentence lengths naturally
+- avoid repetitive phrasing
+- keep all key points from source
 
-Text:
+Text to polish:
 {combined}
 """
     )
 
-    # paragraph restructuring
-    step2 = _make_paragraphs(step2)
-    step2 = _light_reorder_paragraphs(step2)
+async def _generate_best_candidate(text: str, mode: str, plan: str) -> str:
+    candidate_count = _get_candidate_count(plan)
+    style_hints = [
+        "direct and structured",
+        "slightly conversational but professional",
+        "clear explanatory with concrete phrasing",
+    ]
+    selected_hints = style_hints[:candidate_count]
 
-    # 🔥 FINAL PASS ONLY FOR HARD TEXT
-    if is_hard:
-        voice = _pick_voice()
-        step3 = await _call_claude(
-            f"""
-Rewrite this with a {voice}.
+    candidates = await asyncio.gather(
+        *[
+            _single_candidate_rewrite(text=text, mode=mode, style_hint=hint)
+            for hint in selected_hints
+        ]
+    )
 
-- you may slightly change order
-- keep meaning exact
-- avoid smooth AI flow
+    best_text = candidates[0]
+    best_score = score_candidate(text, best_text)
 
-Text:
-{step2}
-"""
+    for candidate in candidates[1:]:
+        candidate_score = score_candidate(text, candidate)
+        if candidate_score.total > best_score.total:
+            best_text = candidate
+            best_score = candidate_score
+
+    # One rescue attempt if all candidates fail the gate.
+    if not best_score.passed and candidate_count > 1:
+        rescue = await _single_candidate_rewrite(
+            text=text,
+            mode=mode,
+            style_hint="high-fidelity rewrite focused on retaining every key idea",
         )
-        return step3
+        rescue_score = score_candidate(text, rescue)
+        if rescue_score.total > best_score.total:
+            best_text = rescue
+            best_score = rescue_score
 
-    return step2
+    logger.info(
+        "quality_gate score=%.4f passed=%s meaning=%.4f diversity=%.4f",
+        best_score.total,
+        best_score.passed,
+        best_score.meaning_overlap,
+        best_score.diversity,
+    )
+    return best_text
 
 
 # ============================
@@ -178,7 +170,7 @@ async def generate_humanized_text(text: str, mode: str, plan: str) -> Generation
 
     if _client:
         try:
-            result = await _multi_pass_rewrite(text)
+            result = await _generate_best_candidate(text=text, mode=mode, plan=plan)
             result = humanize_post_process(result, mode)
 
             return GenerationResult(result, "anthropic", _MODEL, False)
